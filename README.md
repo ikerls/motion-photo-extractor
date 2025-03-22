@@ -80,6 +80,6 @@ log:
 
 ## Installation
 
-Binary releases are available for Linux, macOS, and Windows on the [releases page](https://github.com/ikerls/motion-photos-extractor/releases).
+Binary releases are available for Linux, macOS, and Windows on the [releases page](https://github.com/ikerls/motion-photo-extractor/releases).
 
 Note: This tool is specifically designed for Samsung Motion Photos and may not work with motion photo formats from other manufacturers.
