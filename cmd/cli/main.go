@@ -75,13 +75,18 @@ func processRegexPattern(pattern *regexp.Regexp, cfg *config.Config, e *extracto
 		return fmt.Errorf("failed to read directory: %w", err)
 	}
 
-	log.Infof("Found %d matches for regex pattern\n", len(pattern.FindAllString(cfg.InputFile, -1)))
+	matches := make([]string, 0)
 	for _, entry := range entries {
 		if !entry.IsDir() && pattern.MatchString(entry.Name()) && isValidExtension(entry.Name()) {
-			fullPath := filepath.Join(dir, entry.Name())
-			if err := e.Process(fullPath, cfg.OutputDir, cfg.DeleteOrig, cfg.RenameOrig, cfg.ExtractPhoto, cfg.ExtractVideo, cfg.Force); err != nil {
-				log.Errorf("Error processing %s: %v\n", fullPath, err)
-			}
+			matches = append(matches, entry.Name())
+		}
+	}
+
+	log.Infof("Found %d files matching regex pattern: %s\n", len(matches), pattern.String())
+	for _, name := range matches {
+		fullPath := filepath.Join(dir, name)
+		if err := e.Process(fullPath, cfg.OutputDir, cfg.DeleteOrig, cfg.RenameOrig, cfg.ExtractPhoto, cfg.ExtractVideo, cfg.Force); err != nil {
+			log.Errorf("Error processing %s: %v\n", fullPath, err)
 		}
 	}
 	return nil
