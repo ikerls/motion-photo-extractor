@@ -101,8 +101,7 @@ func Load() (*Config, error) {
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 
 	if err := viper.ReadInConfig(); err != nil {
-		var configFileNotFoundError viper.ConfigFileNotFoundError
-		if !errors.As(err, &configFileNotFoundError) {
+		if _, ok := errors.AsType[viper.ConfigFileNotFoundError](err); !ok {
 			return nil, fmt.Errorf("failed to read config file: %w", err)
 		}
 	}
