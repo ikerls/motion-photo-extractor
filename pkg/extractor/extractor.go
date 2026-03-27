@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"github.com/charmbracelet/log"
-	"github.com/ikerls/motion-photos-extractor/pkg/files"
+	"github.com/ikerls/motion-photo-extractor/pkg/files"
 	"os"
 	"path/filepath"
 	"strings"

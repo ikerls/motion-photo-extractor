@@ -3,9 +3,9 @@ package main
 import (
 	"fmt"
 	"github.com/charmbracelet/log"
-	"github.com/ikerls/motion-photos-extractor/internal/config"
-	"github.com/ikerls/motion-photos-extractor/internal/logger"
-	"github.com/ikerls/motion-photos-extractor/pkg/extractor"
+	"github.com/ikerls/motion-photo-extractor/internal/config"
+	"github.com/ikerls/motion-photo-extractor/internal/logger"
+	"github.com/ikerls/motion-photo-extractor/pkg/extractor"
 	"os"
 	"path/filepath"
 	"regexp"

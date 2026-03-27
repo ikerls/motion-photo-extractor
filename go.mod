@@ -1,4 +1,4 @@
-module github.com/ikerls/motion-photos-extractor
+module github.com/ikerls/motion-photo-extractor
 
 go 1.23.5
 
