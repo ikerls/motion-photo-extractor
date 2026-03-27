@@ -25,6 +25,7 @@ A command-line tool for handling **Samsung Motion Photos**. Extract video and im
 - `--delete-orig`: Remove original file after successful extraction
 - `--rename-orig`: Use base name for extracted files, add `_original` to source file
 - `--extract-photo`: Extract photo component (default: true)
+- `--extract-video`: Extract video component (default: true)
 - `--force`: Overwrite existing output files
 
 ### Logging Options
@@ -62,6 +63,9 @@ go-motion-photo --input /IMG_\d{4}\.jpg/
 # Keep original naming scheme
 go-motion-photo --input photo.jpg --rename-orig
 
+# Extract only the photo component
+go-motion-photo --input photo.jpg --extract-video=false
+
 # Process HEIC file and overwrite existing outputs
 go-motion-photo --input photo.heic --force
 ```
@@ -72,6 +76,7 @@ input: "./photos"
 output: "./extracted"
 delete_orig: false
 rename_orig: true
+extract_video: false
 log:
   file: "motion-photo.log"
   level: "info"

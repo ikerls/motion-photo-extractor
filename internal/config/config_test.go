@@ -29,6 +29,9 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	if !cfg.ExtractPhoto {
 		t.Fatal("ExtractPhoto = false, want true")
 	}
+	if !cfg.ExtractVideo {
+		t.Fatal("ExtractVideo = false, want true")
+	}
 	if cfg.Log.Level != "info" {
 		t.Fatalf("Log.Level = %q, want %q", cfg.Log.Level, "info")
 	}
@@ -60,6 +63,7 @@ func TestLoadParsesKebabCaseCLIFlags(t *testing.T) {
 		"--delete-orig",
 		"--rename-orig",
 		"--extract-photo=false",
+		"--extract-video=false",
 		"--log-file", "motion-photo.log",
 		"--log-level", "debug",
 		"--no-console-log",
@@ -81,6 +85,9 @@ func TestLoadParsesKebabCaseCLIFlags(t *testing.T) {
 	if cfg.ExtractPhoto {
 		t.Fatal("ExtractPhoto = true, want false")
 	}
+	if cfg.ExtractVideo {
+		t.Fatal("ExtractVideo = true, want false")
+	}
 	if !cfg.Force {
 		t.Fatal("Force = false, want true")
 	}
@@ -98,7 +105,7 @@ func TestLoadParsesKebabCaseCLIFlags(t *testing.T) {
 func TestLoadAllowsKebabCaseCLIToOverrideConfigFile(t *testing.T) {
 	tempDir := t.TempDir()
 	configPath := filepath.Join(tempDir, "go-motion-photo.yaml")
-	configContent := []byte("delete_orig: false\nrename_orig: false\nextract_photo: true\nlog:\n  level: info\n  no_console: false\n")
+	configContent := []byte("delete_orig: false\nrename_orig: false\nextract_photo: true\nextract_video: true\nlog:\n  level: info\n  no_console: false\n")
 	if err := os.WriteFile(configPath, configContent, 0644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -108,6 +115,7 @@ func TestLoadAllowsKebabCaseCLIToOverrideConfigFile(t *testing.T) {
 		"--delete-orig",
 		"--rename-orig",
 		"--extract-photo=false",
+		"--extract-video=false",
 		"--log-level", "debug",
 		"--no-console-log",
 	)
@@ -120,6 +128,9 @@ func TestLoadAllowsKebabCaseCLIToOverrideConfigFile(t *testing.T) {
 	}
 	if cfg.ExtractPhoto {
 		t.Fatal("ExtractPhoto = true, want false")
+	}
+	if cfg.ExtractVideo {
+		t.Fatal("ExtractVideo = true, want false")
 	}
 	if cfg.Log.Level != "debug" {
 		t.Fatalf("Log.Level = %q, want %q", cfg.Log.Level, "debug")
