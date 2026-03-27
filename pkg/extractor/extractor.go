@@ -3,12 +3,13 @@ package extractor
 import (
 	"bytes"
 	"fmt"
-	"github.com/charmbracelet/log"
-	"github.com/ikerls/motion-photo-extractor/pkg/files"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/charmbracelet/log"
+	"github.com/ikerls/motion-photo-extractor/pkg/files"
 )
 
 var (
@@ -22,7 +23,11 @@ func New() *Extractor {
 	return &Extractor{}
 }
 
-func (e *Extractor) Process(filename, outputDir string, deleteOrig, renameOrig, extractPhoto bool, force bool) error {
+func (e *Extractor) Process(filename, outputDir string, deleteOrig, renameOrig, extractPhoto, extractVideo bool, force bool) error {
+	if !extractPhoto && !extractVideo {
+		return fmt.Errorf("nothing to extract: both photo and video extraction are disabled")
+	}
+
 	if err := validateExtension(filename); err != nil {
 		return err
 	}
@@ -39,7 +44,7 @@ func (e *Extractor) Process(filename, outputDir string, deleteOrig, renameOrig, 
 	}
 
 	return e.writeFiles(filename, outputDir, jpegData, mp4Data, fileInfo.ModTime(),
-		deleteOrig, renameOrig, extractPhoto, force)
+		deleteOrig, renameOrig, extractPhoto, extractVideo, force)
 }
 
 func (e *Extractor) splitContent(data []byte) (jpegData, mp4Data []byte, err error) {
@@ -62,7 +67,7 @@ func (e *Extractor) splitContent(data []byte) (jpegData, mp4Data []byte, err err
 }
 
 func (e *Extractor) writeFiles(filename, outputDir string, jpegData, mp4Data []byte, modTime time.Time,
-	deleteOrig, renameOrig, extractPhoto bool, force bool) error {
+	deleteOrig, renameOrig, extractPhoto, extractVideo bool, force bool) error {
 	log.Infof("Writing files to: %s\n", outputDir)
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return fmt.Errorf("failed to create output directory: %v", err)
@@ -77,9 +82,11 @@ func (e *Extractor) writeFiles(filename, outputDir string, jpegData, mp4Data []b
 				extractPhoto = false
 			}
 		}
-		if _, err := os.Stat(mp4Path); err == nil {
-			log.Warnf("MP4 file already exists: %s (skipping video extraction)\n", mp4Path)
-			return nil
+		if extractVideo {
+			if _, err := os.Stat(mp4Path); err == nil {
+				log.Warnf("MP4 file already exists: %s (skipping video extraction)\n", mp4Path)
+				extractVideo = false
+			}
 		}
 	}
 
@@ -97,9 +104,13 @@ func (e *Extractor) writeFiles(filename, outputDir string, jpegData, mp4Data []b
 		photoSuccess = true // Skip photo extraction but mark as success
 	}
 
-	log.Debugf("Writing MP4 video (%d bytes) to: %s\n", len(mp4Data), mp4Path)
-	if err := files.WriteFileWithTimestamp(mp4Path, mp4Data, modTime); err != nil {
-		log.Errorf("Error writing MP4 file: %v\n", err)
+	if extractVideo {
+		log.Debugf("Writing MP4 video (%d bytes) to: %s\n", len(mp4Data), mp4Path)
+		if err := files.WriteFileWithTimestamp(mp4Path, mp4Data, modTime); err != nil {
+			log.Errorf("Error writing MP4 file: %v\n", err)
+		} else {
+			videoSuccess = true
+		}
 	} else {
 		videoSuccess = true
 	}
@@ -126,7 +137,9 @@ func (e *Extractor) writeFiles(filename, outputDir string, jpegData, mp4Data []b
 		if extractPhoto {
 			log.Infof("- JPEG image: %s\n", jpegPath)
 		}
-		log.Infof("- MP4 video: %s\n", mp4Path)
+		if extractVideo {
+			log.Infof("- MP4 video: %s\n", mp4Path)
+		}
 		return nil
 	}
 

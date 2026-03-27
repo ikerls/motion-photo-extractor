@@ -26,6 +26,24 @@ func TestProcessInputsSingleFile(t *testing.T) {
 	assertFileExists(t, filepath.Join(output, "single_video.mp4"))
 }
 
+func TestProcessInputsSingleFileWithoutVideoExtraction(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "single.jpg")
+	output := filepath.Join(tempDir, "out")
+	writeMotionPhotoFixture(t, input)
+
+	cfg := testConfig(input, output)
+	cfg.ExtractVideo = false
+	e := extractor.New()
+
+	if err := processInputs(cfg, e); err != nil {
+		t.Fatalf("processInputs() error = %v", err)
+	}
+
+	assertFileExists(t, filepath.Join(output, "single_photo.jpg"))
+	assertFileDoesNotExist(t, filepath.Join(output, "single_video.mp4"))
+}
+
 func TestProcessInputsDirectoryProcessesSupportedFiles(t *testing.T) {
 	tempDir := t.TempDir()
 	inputDir := filepath.Join(tempDir, "in")
@@ -125,6 +143,7 @@ func testConfig(input, output string) *config.Config {
 		InputFile:    input,
 		OutputDir:    output,
 		ExtractPhoto: true,
+		ExtractVideo: true,
 	}
 }
 

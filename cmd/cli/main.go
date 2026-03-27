@@ -2,14 +2,15 @@ package main
 
 import (
 	"fmt"
-	"github.com/charmbracelet/log"
-	"github.com/ikerls/motion-photo-extractor/internal/config"
-	"github.com/ikerls/motion-photo-extractor/internal/logger"
-	"github.com/ikerls/motion-photo-extractor/pkg/extractor"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/charmbracelet/log"
+	"github.com/ikerls/motion-photo-extractor/internal/config"
+	"github.com/ikerls/motion-photo-extractor/internal/logger"
+	"github.com/ikerls/motion-photo-extractor/pkg/extractor"
 )
 
 func processInputs(cfg *config.Config, e *extractor.Extractor) error {
@@ -40,7 +41,7 @@ func processInputs(cfg *config.Config, e *extractor.Extractor) error {
 	}
 
 	log.Infof("Processing single file: %s\n", cfg.InputFile)
-	return e.Process(cfg.InputFile, cfg.OutputDir, cfg.DeleteOrig, cfg.RenameOrig, cfg.ExtractPhoto, cfg.Force)
+	return e.Process(cfg.InputFile, cfg.OutputDir, cfg.DeleteOrig, cfg.RenameOrig, cfg.ExtractPhoto, cfg.ExtractVideo, cfg.Force)
 }
 
 func processDirectory(dir string, cfg *config.Config, e *extractor.Extractor) error {
@@ -49,7 +50,7 @@ func processDirectory(dir string, cfg *config.Config, e *extractor.Extractor) er
 			return err
 		}
 		if !info.IsDir() && isValidExtension(path) {
-			if err := e.Process(path, cfg.OutputDir, cfg.DeleteOrig, cfg.RenameOrig, cfg.ExtractPhoto, cfg.Force); err != nil {
+			if err := e.Process(path, cfg.OutputDir, cfg.DeleteOrig, cfg.RenameOrig, cfg.ExtractPhoto, cfg.ExtractVideo, cfg.Force); err != nil {
 				log.Errorf("Error processing %s: %v\n", path, err)
 			}
 		}
@@ -60,7 +61,7 @@ func processDirectory(dir string, cfg *config.Config, e *extractor.Extractor) er
 func processFiles(files []string, cfg *config.Config, e *extractor.Extractor) error {
 	log.Infof("Found %d files \n", len(files))
 	for _, file := range files {
-		if err := e.Process(file, cfg.OutputDir, cfg.DeleteOrig, cfg.RenameOrig, cfg.ExtractPhoto, cfg.Force); err != nil {
+		if err := e.Process(file, cfg.OutputDir, cfg.DeleteOrig, cfg.RenameOrig, cfg.ExtractPhoto, cfg.ExtractVideo, cfg.Force); err != nil {
 			log.Errorf("Error processing %s: %v\n", file, err)
 		}
 	}
@@ -78,7 +79,7 @@ func processRegexPattern(pattern *regexp.Regexp, cfg *config.Config, e *extracto
 	for _, entry := range entries {
 		if !entry.IsDir() && pattern.MatchString(entry.Name()) && isValidExtension(entry.Name()) {
 			fullPath := filepath.Join(dir, entry.Name())
-			if err := e.Process(fullPath, cfg.OutputDir, cfg.DeleteOrig, cfg.RenameOrig, cfg.ExtractPhoto, cfg.Force); err != nil {
+			if err := e.Process(fullPath, cfg.OutputDir, cfg.DeleteOrig, cfg.RenameOrig, cfg.ExtractPhoto, cfg.ExtractVideo, cfg.Force); err != nil {
 				log.Errorf("Error processing %s: %v\n", fullPath, err)
 			}
 		}
