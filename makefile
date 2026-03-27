@@ -4,6 +4,9 @@ run:
 build:
 	go build ./cmd/cli/main.go
 
+test:
+	go test ./...
+
 tidy:
 	go mod tidy
 	go mod vendor

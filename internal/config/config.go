@@ -15,6 +15,7 @@ type Config struct {
 	DeleteOrig   bool   `mapstructure:"delete_orig"`
 	RenameOrig   bool   `mapstructure:"rename_orig"`
 	ExtractPhoto bool   `mapstructure:"extract_photo"`
+	ExtractVideo bool   `mapstructure:"extract_video"`
 	Force        bool   `mapstructure:"force"`
 	Log          struct {
 		File      string `mapstructure:"file"`
@@ -39,6 +40,7 @@ Output Options:
   --rename-orig        Rename original file instead of adding suffixes to extracted files
                        (Original gets _original suffix, extracted files use base name)
   --extract-photo      Extract the photo component (default: true)
+  --extract-video      Extract the video component (default: true)
   --force              Force overwrite of existing output files
 
 Logging Options:
@@ -58,6 +60,7 @@ Examples:
   go-motion-photo --input ./photos                         # Process all supported files in directory
   go-motion-photo --input /IMG_\d{4}\.jpg/                 # Process files matching regex pattern
   go-motion-photo --input photo.jpg --rename-orig          # Keep original naming scheme
+  go-motion-photo --input photo.jpg --extract-video=false  # Extract only photo component
   go-motion-photo --input photo.heic --force               # Process HEIC file and overwrite existing outputs`
 
 func Load() (*Config, error) {
@@ -66,6 +69,7 @@ func Load() (*Config, error) {
 	pflag.Bool("delete-orig", false, "Delete original file after successful extraction")
 	pflag.Bool("rename-orig", false, "Rename original file and don't append _photo/_video to extracted files")
 	pflag.Bool("extract-photo", true, "Extract photo part")
+	pflag.Bool("extract-video", true, "Extract video part")
 	pflag.String("config", "", "Config file path (optional)")
 	pflag.Bool("force", false, "Force overwrite existing files")
 	pflag.String("log-file", "", "Log to file")
@@ -77,7 +81,9 @@ func Load() (*Config, error) {
 	}
 	pflag.Parse()
 
-	viper.BindPFlags(pflag.CommandLine)
+	if err := viper.BindPFlags(pflag.CommandLine); err != nil {
+		return nil, fmt.Errorf("failed to bind CLI flags: %w", err)
+	}
 
 	// Handle positional arguments
 	args := pflag.Args()
@@ -95,17 +101,19 @@ func Load() (*Config, error) {
 
 	viper.SetDefault("output", ".")
 	viper.SetDefault("extract_photo", true)
+	viper.SetDefault("extract_video", true)
 	viper.SetDefault("log.level", "info")
 	viper.SetDefault("log.no_console", false)
 
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 
 	if err := viper.ReadInConfig(); err != nil {
-		var configFileNotFoundError viper.ConfigFileNotFoundError
-		if !errors.As(err, &configFileNotFoundError) {
+		if _, ok := errors.AsType[viper.ConfigFileNotFoundError](err); !ok {
 			return nil, fmt.Errorf("failed to read config file: %w", err)
 		}
 	}
+
+	applyCLIOverrides()
 
 	var cfg Config
 	if err := viper.Unmarshal(&cfg); err != nil {
@@ -113,4 +121,23 @@ func Load() (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+func applyCLIOverrides() {
+	overrides := map[string]string{
+		"delete-orig":    "delete_orig",
+		"rename-orig":    "rename_orig",
+		"extract-photo":  "extract_photo",
+		"extract-video":  "extract_video",
+		"log-file":       "log.file",
+		"log-level":      "log.level",
+		"no-console-log": "log.no_console",
+	}
+
+	for flagName, configKey := range overrides {
+		flag := pflag.Lookup(flagName)
+		if flag != nil && flag.Changed {
+			viper.Set(configKey, viper.Get(flagName))
+		}
+	}
 }
