@@ -77,7 +77,9 @@ func Load() (*Config, error) {
 	}
 	pflag.Parse()
 
-	viper.BindPFlags(pflag.CommandLine)
+	if err := viper.BindPFlags(pflag.CommandLine); err != nil {
+		return nil, fmt.Errorf("failed to bind CLI flags: %w", err)
+	}
 
 	// Handle positional arguments
 	args := pflag.Args()
@@ -106,10 +108,30 @@ func Load() (*Config, error) {
 		}
 	}
 
+	applyCLIOverrides()
+
 	var cfg Config
 	if err := viper.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal configuration: %w", err)
 	}
 
 	return &cfg, nil
+}
+
+func applyCLIOverrides() {
+	overrides := map[string]string{
+		"delete-orig":    "delete_orig",
+		"rename-orig":    "rename_orig",
+		"extract-photo":  "extract_photo",
+		"log-file":       "log.file",
+		"log-level":      "log.level",
+		"no-console-log": "log.no_console",
+	}
+
+	for flagName, configKey := range overrides {
+		flag := pflag.Lookup(flagName)
+		if flag != nil && flag.Changed {
+			viper.Set(configKey, viper.Get(flagName))
+		}
+	}
 }
