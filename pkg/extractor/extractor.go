@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,6 +17,11 @@ import (
 var (
 	magicV1 = []byte("MotionPhoto_Data")
 	magicV2 = []byte("mpvd")
+
+	containerItemRe     = regexp.MustCompile(`(?s)<[^>]*Item:Semantic="[^"]+"[^>]*/>`)
+	semanticAttrRe      = regexp.MustCompile(`Item:Semantic="([^"]+)"`)
+	lengthAttrRe        = regexp.MustCompile(`Item:Length="(\d+)"`)
+	motionPhotoOffsetRe = regexp.MustCompile(`(?:GCamera|Camera):(?:MicroVideo|MotionPhoto)Offset="(\d+)"`)
 )
 
 type Extractor struct{}
@@ -48,22 +55,90 @@ func (e *Extractor) Process(filename, outputDir string, deleteOrig, renameOrig, 
 }
 
 func (e *Extractor) splitContent(data []byte) (jpegData, mp4Data []byte, err error) {
-	log.Debugf("Searching for motion photo marker...")
+	log.Debugf("Searching for motion photo split point...")
 
-	markerIndex := bytes.Index(data, magicV2)
-	markerSize := len(magicV2)
-
-	if markerIndex == -1 {
-		markerIndex = bytes.Index(data, magicV1)
-		markerSize = len(magicV1)
+	videoStart, splitSource, err := findVideoStart(data)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	if markerIndex == -1 {
-		return nil, nil, fmt.Errorf("no motion photo marker found in file")
+	jpegEnd := findJPEGEnd(data[:videoStart])
+	if jpegEnd == -1 {
+		jpegEnd = videoStart
 	}
 
-	log.Debugf("Found marker at position: %d\n", markerIndex)
-	return data[:markerIndex], data[markerIndex+markerSize:], nil
+	log.Debugf("Using %s split point at position: %d\n", splitSource, videoStart)
+	return data[:jpegEnd], data[videoStart:], nil
+}
+
+func findVideoStart(data []byte) (int, string, error) {
+	if videoLength, ok := findMotionPhotoVideoLength(data); ok {
+		videoStart := len(data) - videoLength
+		if videoStart < 0 || videoStart >= len(data) {
+			return 0, "", fmt.Errorf("invalid motion photo video length: %d", videoLength)
+		}
+		return videoStart, "metadata", nil
+	}
+
+	if markerIndex := bytes.LastIndex(data, magicV1); markerIndex != -1 {
+		return markerIndex + len(magicV1), "MotionPhoto_Data marker", nil
+	}
+
+	if markerIndex := bytes.LastIndex(data, magicV2); markerIndex != -1 {
+		return markerIndex + len(magicV2), "mpvd marker", nil
+	}
+
+	return 0, "", fmt.Errorf("no motion photo metadata or marker found in file")
+}
+
+func findMotionPhotoVideoLength(data []byte) (int, bool) {
+	for _, item := range containerItemRe.FindAll(data, -1) {
+		semantic, ok := findAttribute(item, semanticAttrRe)
+		if !ok || semantic != "MotionPhoto" {
+			continue
+		}
+
+		length, ok := findIntAttribute(item, lengthAttrRe)
+		if ok && length > 0 {
+			return length, true
+		}
+	}
+
+	offset, ok := findIntAttribute(data, motionPhotoOffsetRe)
+	if ok && offset > 0 {
+		return offset, true
+	}
+
+	return 0, false
+}
+
+func findAttribute(data []byte, re *regexp.Regexp) (string, bool) {
+	match := re.FindSubmatch(data)
+	if len(match) < 2 {
+		return "", false
+	}
+	return string(match[1]), true
+}
+
+func findIntAttribute(data []byte, re *regexp.Regexp) (int, bool) {
+	value, ok := findAttribute(data, re)
+	if !ok {
+		return 0, false
+	}
+
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, false
+	}
+	return parsed, true
+}
+
+func findJPEGEnd(data []byte) int {
+	eoiIndex := bytes.LastIndex(data, []byte{0xFF, 0xD9})
+	if eoiIndex == -1 {
+		return -1
+	}
+	return eoiIndex + 2
 }
 
 func (e *Extractor) writeFiles(filename, outputDir string, jpegData, mp4Data []byte, modTime time.Time,

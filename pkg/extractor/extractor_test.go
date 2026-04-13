@@ -1,6 +1,7 @@
 package extractor
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
@@ -48,6 +49,43 @@ func TestProcessReturnsErrorWhenBothExtractionsDisabled(t *testing.T) {
 	err := e.Process(input, output, false, false, false, false, false)
 	if err == nil {
 		t.Fatal("Process() error = nil, want non-nil")
+	}
+}
+
+func TestSplitContentPrefersMetadataOverStrayMPVDAndTrimsPadding(t *testing.T) {
+	e := New()
+
+	mp4Data := []byte{
+		0x00, 0x00, 0x00, 0x10,
+		'f', 't', 'y', 'p',
+		'm', 'p', '4', '2',
+		'd', 'a', 't', 'a',
+	}
+
+	xmp := []byte(`<x:xmpmeta><Container:Directory>` +
+		`<Container:Item Item:Mime="image/jpeg" Item:Semantic="Primary" Item:Padding="5"/>` +
+		`<Container:Item Item:Mime="video/mp4" Item:Semantic="MotionPhoto" Item:Length="16" Item:Padding="0"/>` +
+		`</Container:Directory></x:xmpmeta>`)
+
+	jpegData := append([]byte{0xFF, 0xD8}, xmp...)
+	jpegData = append(jpegData, []byte("stray-mpvd-inside-jpeg")...)
+	jpegData = append(jpegData, 0xFF, 0xD9)
+
+	padding := []byte("ABCDE")
+	motionPhoto := append(append([]byte{}, jpegData...), padding...)
+	motionPhoto = append(motionPhoto, mp4Data...)
+
+	extractedJPEG, extractedMP4, err := e.splitContent(motionPhoto)
+	if err != nil {
+		t.Fatalf("splitContent() error = %v", err)
+	}
+
+	if !bytes.Equal(extractedJPEG, jpegData) {
+		t.Fatalf("unexpected JPEG extraction: got %q want %q", extractedJPEG, jpegData)
+	}
+
+	if !bytes.Equal(extractedMP4, mp4Data) {
+		t.Fatalf("unexpected MP4 extraction: got %q want %q", extractedMP4, mp4Data)
 	}
 }
 
