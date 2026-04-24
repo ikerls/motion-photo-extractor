@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -42,6 +44,24 @@ func TestProcessInputsSingleFileWithoutVideoExtraction(t *testing.T) {
 
 	assertFileExists(t, filepath.Join(output, "single_photo.jpg"))
 	assertFileDoesNotExist(t, filepath.Join(output, "single_video.mp4"))
+}
+
+func TestProcessInputsSingleFileRejectsFalsePositive(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "false-positive.jpg")
+	output := filepath.Join(tempDir, "out")
+	writeFalsePositiveFixture(t, input)
+
+	cfg := testConfig(input, output)
+	e := extractor.New()
+
+	err := processInputs(cfg, e)
+	if err == nil {
+		t.Fatal("processInputs() error = nil, want non-nil")
+	}
+
+	assertFileDoesNotExist(t, filepath.Join(output, "false-positive_photo.jpg"))
+	assertFileDoesNotExist(t, filepath.Join(output, "false-positive_video.mp4"))
 }
 
 func TestProcessInputsDirectoryProcessesSupportedFiles(t *testing.T) {
@@ -149,10 +169,61 @@ func testConfig(input, output string) *config.Config {
 
 func writeMotionPhotoFixture(t *testing.T, path string) {
 	t.Helper()
-	data := []byte("jpeg-data-prefix" + "mpvd" + "mp4-data-payload")
+	data := buildMotionPhotoFixture()
 	if err := os.WriteFile(path, data, 0644); err != nil {
 		t.Fatalf("write fixture %s: %v", path, err)
 	}
+}
+
+func writeFalsePositiveFixture(t *testing.T, path string) {
+	t.Helper()
+	data := buildFalsePositiveFixture()
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		t.Fatalf("write false positive fixture %s: %v", path, err)
+	}
+}
+
+func buildMotionPhotoFixture() []byte {
+	mp4Data := []byte{
+		0x00, 0x00, 0x00, 0x18,
+		'f', 't', 'y', 'p',
+		'm', 'p', '4', '2',
+		0x00, 0x00, 0x00, 0x00,
+		'i', 's', 'o', 'm',
+		'm', 'p', '4', '2',
+	}
+
+	xmp := []byte(fmt.Sprintf(`<x:xmpmeta><rdf:RDF><rdf:Description `+
+		`xmlns:GCamera="http://ns.google.com/photos/1.0/camera/" `+
+		`xmlns:Container="http://ns.google.com/photos/1.0/container/" `+
+		`xmlns:Item="http://ns.google.com/photos/1.0/container/item/" `+
+		`GCamera:MotionPhoto="1" `+
+		`GCamera:MotionPhotoVersion="1" `+
+		`GCamera:MotionPhotoPresentationTimestampUs="123456" `+
+		`GCamera:MotionPhotoOffset="%d">`+
+		`<Container:Directory><rdf:Seq>`+
+		`<rdf:li rdf:parseType="Resource"><Container:Item Item:Mime="image/jpeg" Item:Semantic="Primary" Item:Length="0" Item:Padding="5"/></rdf:li>`+
+		`<rdf:li rdf:parseType="Resource"><Container:Item Item:Mime="video/mp4" Item:Semantic="MotionPhoto" Item:Length="%d" Item:Padding="0"/></rdf:li>`+
+		`</rdf:Seq></Container:Directory></rdf:Description></rdf:RDF></x:xmpmeta>`, len(mp4Data), len(mp4Data)))
+
+	jpegData := append([]byte{0xFF, 0xD8}, xmp...)
+	jpegData = append(jpegData, []byte("stray-mpvd-inside-jpeg")...)
+	jpegData = append(jpegData, 0xFF, 0xD9)
+
+	data := append([]byte{}, jpegData...)
+	data = append(data, []byte("MotionPhoto_Data")...)
+	data = append(data, mp4Data...)
+	return data
+}
+
+func buildFalsePositiveFixture() []byte {
+	jpegData := append([]byte{0xFF, 0xD8}, []byte("plain-jpeg-data")...)
+	jpegData = append(jpegData, 0xFF, 0xD9)
+
+	data := append([]byte{}, jpegData...)
+	data = append(data, bytes.Repeat([]byte{0x00}, 32)...)
+	data = append(data, []byte("mpvdnot-an-mp4-payload")...)
+	return data
 }
 
 func withWorkingDirectory(t *testing.T, dir string, fn func()) {
