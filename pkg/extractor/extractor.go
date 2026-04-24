@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -21,20 +19,35 @@ var (
 	jpegSOI = []byte{0xFF, 0xD8}
 	jpegEOI = []byte{0xFF, 0xD9}
 
-	containerItemRe     = regexp.MustCompile(`(?s)<[^>]*Item:Semantic="[^"]+"[^>]*/>`)
-	semanticAttrRe      = regexp.MustCompile(`Item:Semantic="([^"]+)"`)
-	lengthAttrRe        = regexp.MustCompile(`Item:Length="(\d+)"`)
-	motionPhotoOffsetRe = regexp.MustCompile(`(?:GCamera|Camera):(?:MicroVideo|MotionPhoto)Offset="(\d+)"`)
-	offsetValueRe       = regexp.MustCompile(`((?:GCamera|Camera):(?:MicroVideo|MotionPhoto)Offset=")(\d+)(")`)
-	semanticValueRe     = regexp.MustCompile(`Item:Semantic="MotionPhoto"`)
+	xmpStartTag = []byte("<x:xmpmeta")
+	xmpEndTag   = []byte("</x:xmpmeta>")
+
+	motionPhotoSemantic = []byte(`Item:Semantic="MotionPhoto"`)
+	stillImageSemantic  = []byte(`Item:Semantic="Still_Image"`)
+	lengthAttrPrefix    = []byte(`Item:Length="`)
+
+	motionPhotoEnabledAttrs = [][2][]byte{
+		{[]byte(`GCamera:MotionPhoto="1"`), []byte(`GCamera:MotionPhoto="0"`)},
+		{[]byte(`Camera:MotionPhoto="1"`), []byte(`Camera:MotionPhoto="0"`)},
+		{[]byte(`GCamera:MicroVideo="1"`), []byte(`GCamera:MicroVideo="0"`)},
+		{[]byte(`Camera:MicroVideo="1"`), []byte(`Camera:MicroVideo="0"`)},
+	}
+
+	motionPhotoOffsetPrefixes = [][]byte{
+		[]byte(`GCamera:MotionPhotoOffset="`),
+		[]byte(`Camera:MotionPhotoOffset="`),
+		[]byte(`GCamera:MicroVideoOffset="`),
+		[]byte(`Camera:MicroVideoOffset="`),
+	}
 )
 
 type Extractor struct{}
 
-type splitCandidate struct {
-	start  int
-	source string
-}
+const (
+	xmpSearchLimit       = 512 << 10
+	markerTailSearchSize = 16 << 20
+	jpegTailSearchSize   = 256 << 10
+)
 
 func New() *Extractor {
 	return &Extractor{}
@@ -85,61 +98,93 @@ func (e *Extractor) splitContent(data []byte) (jpegData, mp4Data []byte, err err
 }
 
 func findVideoStart(data []byte) (int, string, error) {
-	candidates := collectSplitCandidates(data)
-	if len(candidates) == 0 {
-		return 0, "", fmt.Errorf("no motion photo metadata or marker found in file")
+	seen := make(map[int]struct{}, 3)
+	issues := make([]string, 0, 3)
+
+	if videoLength, ok := findMotionPhotoVideoLength(data); ok {
+		start := len(data) - videoLength
+		if err := recordCandidateIssue(data, seen, start, "metadata"); err == nil {
+			return start, "metadata", nil
+		} else {
+			issues = append(issues, err.Error())
+		}
 	}
 
-	issues := make([]string, 0, len(candidates))
-	for _, candidate := range candidates {
-		if err := validateSplitCandidate(data, candidate.start); err != nil {
-			issues = append(issues, fmt.Sprintf("%s: %v", candidate.source, err))
-			continue
-		}
-		return candidate.start, candidate.source, nil
+	if start, ok, issue := findMarkerCandidate(data, magicV1, "MotionPhoto_Data marker", seen); ok {
+		return start, "MotionPhoto_Data marker", nil
+	} else if issue != "" {
+		issues = append(issues, issue)
+	}
+
+	if start, ok, issue := findMarkerCandidate(data, magicV2, "mpvd marker", seen); ok {
+		return start, "mpvd marker", nil
+	} else if issue != "" {
+		issues = append(issues, issue)
+	}
+
+	if len(issues) == 0 {
+		return 0, "", fmt.Errorf("no motion photo metadata or marker found in file")
 	}
 
 	return 0, "", fmt.Errorf("no valid motion photo video found: %s", strings.Join(issues, "; "))
 }
 
-func collectSplitCandidates(data []byte) []splitCandidate {
-	candidates := make([]splitCandidate, 0, 3)
+func recordCandidateIssue(data []byte, seen map[int]struct{}, start int, source string) error {
+	if _, ok := seen[start]; ok {
+		return fmt.Errorf("%s: duplicate split candidate at %d", source, start)
+	}
+	seen[start] = struct{}{}
 
-	if videoLength, ok := findMotionPhotoVideoLength(data); ok {
-		candidates = append(candidates, splitCandidate{
-			start:  len(data) - videoLength,
-			source: "metadata",
-		})
+	if err := validateSplitCandidate(data, start); err != nil {
+		return fmt.Errorf("%s: %v", source, err)
 	}
 
-	if markerIndex := bytes.LastIndex(data, magicV1); markerIndex != -1 {
-		candidates = append(candidates, splitCandidate{
-			start:  markerIndex + len(magicV1),
-			source: "MotionPhoto_Data marker",
-		})
-	}
-
-	if markerIndex := bytes.LastIndex(data, magicV2); markerIndex != -1 {
-		candidates = append(candidates, splitCandidate{
-			start:  markerIndex + len(magicV2),
-			source: "mpvd marker",
-		})
-	}
-
-	return dedupeSplitCandidates(candidates)
+	return nil
 }
 
-func dedupeSplitCandidates(candidates []splitCandidate) []splitCandidate {
-	seen := make(map[int]struct{}, len(candidates))
-	deduped := make([]splitCandidate, 0, len(candidates))
-	for _, candidate := range candidates {
-		if _, ok := seen[candidate.start]; ok {
-			continue
-		}
-		seen[candidate.start] = struct{}{}
-		deduped = append(deduped, candidate)
+func findMarkerCandidate(data, magic []byte, source string, seen map[int]struct{}) (int, bool, string) {
+	if len(data) < len(magic) {
+		return 0, false, ""
 	}
-	return deduped
+
+	searchStart := 0
+	if len(data) > markerTailSearchSize {
+		searchStart = len(data) - markerTailSearchSize
+	}
+
+	if start, ok, issue := searchMarkerRegion(data, data[searchStart:], searchStart, magic, source, seen); ok {
+		return start, true, ""
+	} else if issue != "" && searchStart == 0 {
+		return 0, false, issue
+	}
+
+	if searchStart == 0 {
+		return 0, false, ""
+	}
+
+	return searchMarkerRegion(data, data[:searchStart+len(magic)-1], 0, magic, source, seen)
+}
+
+func searchMarkerRegion(data, region []byte, base int, magic []byte, source string, seen map[int]struct{}) (int, bool, string) {
+	var lastIssue string
+
+	for len(region) >= len(magic) {
+		markerIndex := bytes.LastIndex(region, magic)
+		if markerIndex == -1 {
+			break
+		}
+
+		start := base + markerIndex + len(magic)
+		if err := recordCandidateIssue(data, seen, start, source); err == nil {
+			return start, true, ""
+		} else {
+			lastIssue = err.Error()
+		}
+
+		region = region[:markerIndex]
+	}
+
+	return 0, false, lastIssue
 }
 
 func validateSplitCandidate(data []byte, start int) error {
@@ -148,7 +193,7 @@ func validateSplitCandidate(data []byte, start int) error {
 	}
 
 	if bytes.HasPrefix(data, jpegSOI) {
-		if findJPEGEnd(data[:start]) == -1 {
+		if findJPEGEndBefore(data, start) == -1 {
 			return fmt.Errorf("no JPEG end marker before candidate")
 		}
 	}
@@ -161,53 +206,146 @@ func validateSplitCandidate(data []byte, start int) error {
 }
 
 func findMotionPhotoVideoLength(data []byte) (int, bool) {
-	for _, item := range containerItemRe.FindAll(data, -1) {
-		semantic, ok := findAttribute(item, semanticAttrRe)
-		if !ok || semantic != "MotionPhoto" {
-			continue
-		}
-
-		length, ok := findIntAttribute(item, lengthAttrRe)
-		if ok && length > 0 {
-			return length, true
-		}
+	searchArea := headerSearchArea(data)
+	if xmp, ok := xmpSearchArea(searchArea); ok {
+		searchArea = xmp
 	}
 
-	offset, ok := findIntAttribute(data, motionPhotoOffsetRe)
-	if ok && offset > 0 {
+	if length, ok := findMotionPhotoItemLength(searchArea); ok {
+		return length, true
+	}
+
+	if offset, ok := findFirstIntAttribute(searchArea, motionPhotoOffsetPrefixes...); ok {
 		return offset, true
 	}
 
 	return 0, false
 }
 
-func findAttribute(data []byte, re *regexp.Regexp) (string, bool) {
-	match := re.FindSubmatch(data)
-	if len(match) < 2 {
-		return "", false
+func headerSearchArea(data []byte) []byte {
+	if len(data) > xmpSearchLimit {
+		return data[:xmpSearchLimit]
 	}
-	return string(match[1]), true
+	return data
 }
 
-func findIntAttribute(data []byte, re *regexp.Regexp) (int, bool) {
-	value, ok := findAttribute(data, re)
+func xmpSearchArea(data []byte) ([]byte, bool) {
+	start, end, ok := findXMPBlock(data)
 	if !ok {
+		return nil, false
+	}
+	return data[start:end], true
+}
+
+func findXMPBlock(data []byte) (int, int, bool) {
+	start := bytes.Index(data, xmpStartTag)
+	if start == -1 {
+		return 0, 0, false
+	}
+
+	end := bytes.Index(data[start:], xmpEndTag)
+	if end == -1 {
+		return 0, 0, false
+	}
+
+	end += start + len(xmpEndTag)
+	return start, end, true
+}
+
+func findMotionPhotoItemLength(data []byte) (int, bool) {
+	searchStart := 0
+	for {
+		semanticIndex := bytes.Index(data[searchStart:], motionPhotoSemantic)
+		if semanticIndex == -1 {
+			return 0, false
+		}
+		semanticIndex += searchStart
+
+		tagStart := bytes.LastIndexByte(data[:semanticIndex], '<')
+		tagEnd := bytes.IndexByte(data[semanticIndex:], '>')
+		if tagStart != -1 && tagEnd != -1 {
+			tag := data[tagStart : semanticIndex+tagEnd+1]
+			if length, ok := findIntAttribute(tag, lengthAttrPrefix); ok && length > 0 {
+				return length, true
+			}
+		}
+
+		searchStart = semanticIndex + len(motionPhotoSemantic)
+	}
+}
+
+func findFirstIntAttribute(data []byte, prefixes ...[]byte) (int, bool) {
+	for _, prefix := range prefixes {
+		if value, ok := findIntAttribute(data, prefix); ok && value > 0 {
+			return value, true
+		}
+	}
+	return 0, false
+}
+
+func findIntAttribute(data, prefix []byte) (int, bool) {
+	start := bytes.Index(data, prefix)
+	if start == -1 {
 		return 0, false
 	}
 
-	parsed, err := strconv.Atoi(value)
-	if err != nil {
+	start += len(prefix)
+	end := start
+	for end < len(data) && data[end] >= '0' && data[end] <= '9' {
+		end++
+	}
+
+	if end == start || end >= len(data) || data[end] != '"' {
 		return 0, false
 	}
-	return parsed, true
+
+	return parsePositiveInt(data[start:end])
+}
+
+func parsePositiveInt(data []byte) (int, bool) {
+	if len(data) == 0 {
+		return 0, false
+	}
+
+	value := 0
+	for _, digit := range data {
+		if digit < '0' || digit > '9' {
+			return 0, false
+		}
+		value = (value * 10) + int(digit-'0')
+	}
+
+	return value, true
 }
 
 func findJPEGEnd(data []byte) int {
-	eoiIndex := bytes.LastIndex(data, jpegEOI)
-	if eoiIndex == -1 {
-		return -1
+	return findJPEGEndBefore(data, len(data))
+}
+
+func findJPEGEndBefore(data []byte, limit int) int {
+	if limit > len(data) {
+		limit = len(data)
 	}
-	return eoiIndex + 2
+
+	searchStart := 0
+	if limit > jpegTailSearchSize {
+		searchStart = limit - jpegTailSearchSize
+	}
+
+	eoiIndex := bytes.LastIndex(data[searchStart:limit], jpegEOI)
+	if eoiIndex == -1 {
+		if searchStart == 0 {
+			return -1
+		}
+
+		eoiIndex = bytes.LastIndex(data[:limit], jpegEOI)
+		if eoiIndex == -1 {
+			return -1
+		}
+		return eoiIndex + 2
+	}
+
+	return searchStart + eoiIndex + 2
 }
 
 func looksLikeMP4(data []byte) bool {
@@ -302,34 +440,57 @@ func isAllowedLeadingMP4Box(boxType string) bool {
 }
 
 func sanitizeExtractedPhoto(data []byte) []byte {
-	sanitized := append([]byte(nil), data...)
-
-	replacements := [][2][]byte{
-		{[]byte(`GCamera:MotionPhoto="1"`), []byte(`GCamera:MotionPhoto="0"`)},
-		{[]byte(`Camera:MotionPhoto="1"`), []byte(`Camera:MotionPhoto="0"`)},
-		{[]byte(`GCamera:MicroVideo="1"`), []byte(`GCamera:MicroVideo="0"`)},
-		{[]byte(`Camera:MicroVideo="1"`), []byte(`Camera:MicroVideo="0"`)},
+	searchArea := headerSearchArea(data)
+	start, end, ok := findXMPBlock(searchArea)
+	if !ok {
+		return data
 	}
 
-	for _, replacement := range replacements {
-		sanitized = bytes.ReplaceAll(sanitized, replacement[0], replacement[1])
+	xmp := data[start:end]
+	for _, replacement := range motionPhotoEnabledAttrs {
+		replaceAllSameLength(xmp, replacement[0], replacement[1])
+	}
+	replaceAllSameLength(xmp, motionPhotoSemantic, stillImageSemantic)
+	for _, prefix := range motionPhotoOffsetPrefixes {
+		zeroAttributeDigits(xmp, prefix)
 	}
 
-	sanitized = semanticValueRe.ReplaceAll(sanitized, []byte(`Item:Semantic="Still_Image"`))
-	sanitized = offsetValueRe.ReplaceAllFunc(sanitized, func(match []byte) []byte {
-		parts := offsetValueRe.FindSubmatch(match)
-		if len(parts) != 4 {
-			return match
+	return data
+}
+
+func replaceAllSameLength(data, oldValue, newValue []byte) {
+	if len(oldValue) != len(newValue) {
+		return
+	}
+
+	searchStart := 0
+	for {
+		matchIndex := bytes.Index(data[searchStart:], oldValue)
+		if matchIndex == -1 {
+			return
+		}
+		matchIndex += searchStart
+		copy(data[matchIndex:matchIndex+len(newValue)], newValue)
+		searchStart = matchIndex + len(oldValue)
+	}
+}
+
+func zeroAttributeDigits(data, prefix []byte) {
+	searchStart := 0
+	for {
+		attrIndex := bytes.Index(data[searchStart:], prefix)
+		if attrIndex == -1 {
+			return
 		}
 
-		replacement := make([]byte, 0, len(match))
-		replacement = append(replacement, parts[1]...)
-		replacement = append(replacement, bytes.Repeat([]byte("0"), len(parts[2]))...)
-		replacement = append(replacement, parts[3]...)
-		return replacement
-	})
+		digitIndex := searchStart + attrIndex + len(prefix)
+		for digitIndex < len(data) && data[digitIndex] >= '0' && data[digitIndex] <= '9' {
+			data[digitIndex] = '0'
+			digitIndex++
+		}
 
-	return sanitized
+		searchStart = digitIndex
+	}
 }
 
 func (e *Extractor) writeFiles(filename, outputDir string, jpegData, mp4Data []byte, modTime time.Time,
