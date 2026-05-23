@@ -5,6 +5,9 @@ before:
   hooks:
     - go mod tidy
 
+release:
+  prerelease: auto
+
 builds:
   - id: go-motion-photo
     main: ./cmd/cli/main.go
