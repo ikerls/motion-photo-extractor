@@ -237,3 +237,25 @@ func loadConfigForTestInDir(t *testing.T, dir string, args ...string) *config.Co
 
 	return cfg
 }
+
+func TestLoadReadsConfigFromHomeConfigDirectory(t *testing.T) {
+	home := t.TempDir()
+	configDir := filepath.Join(home, ".config", "go-motion-photo")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "go-motion-photo.yml"), []byte("output: from-home\n"), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	t.Chdir(t.TempDir())
+	t.Setenv("HOME", home)
+
+	cfg, err := config.Load([]string{"photo.jpg"})
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.OutputDir != "from-home" {
+		t.Fatalf("OutputDir = %q, want %q", cfg.OutputDir, "from-home")
+	}
+}

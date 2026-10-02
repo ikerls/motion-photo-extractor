@@ -3,10 +3,13 @@ package config
 import (
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/pflag"
-	"github.com/spf13/viper"
+	"go.yaml.in/yaml/v3"
 )
 
 // ErrHelp is returned by Load when --help was requested.
@@ -16,24 +19,24 @@ type Config struct {
 	// Inputs holds the files, directories or patterns to process. It comes
 	// from --input, the positional arguments, or the "input" config key, in
 	// that order of preference.
-	Inputs []string `mapstructure:"-"`
+	Inputs []string `yaml:"-"`
 
-	OutputDir    string    `mapstructure:"output"`
-	DeleteOrig   bool      `mapstructure:"delete_orig"`
-	RenameOrig   bool      `mapstructure:"rename_orig"`
-	ExtractPhoto bool      `mapstructure:"extract_photo"`
-	ExtractVideo bool      `mapstructure:"extract_video"`
-	Force        bool      `mapstructure:"force"`
-	Log          LogConfig `mapstructure:"log"`
+	OutputDir    string    `yaml:"output"`
+	DeleteOrig   bool      `yaml:"delete_orig"`
+	RenameOrig   bool      `yaml:"rename_orig"`
+	ExtractPhoto bool      `yaml:"extract_photo"`
+	ExtractVideo bool      `yaml:"extract_video"`
+	Force        bool      `yaml:"force"`
+	Log          LogConfig `yaml:"log"`
 
 	// ShowVersion is set when --version was passed.
-	ShowVersion bool `mapstructure:"-"`
+	ShowVersion bool `yaml:"-"`
 }
 
 type LogConfig struct {
-	File      string `mapstructure:"file"`
-	Level     string `mapstructure:"level"`
-	NoConsole bool   `mapstructure:"no_console"`
+	File      string `yaml:"file"`
+	Level     string `yaml:"level"`
+	NoConsole bool   `yaml:"no_console"`
 }
 
 const (
@@ -92,7 +95,8 @@ Examples:
   go-motion-photo --input photo.jpg --extract-video=false  # Extract only photo component
   go-motion-photo --input photo.heic --force               # Process HEIC file and overwrite existing outputs`
 
-// flagKeys maps each CLI flag to the config key it sets.
+// flagKeys maps each CLI flag to the config key it sets. The key also names
+// the environment variable: log.level is read from GO_MOTION_PHOTO_LOG_LEVEL.
 var flagKeys = map[string]string{
 	"input":          "input",
 	"output":         "output",
@@ -110,63 +114,103 @@ var flagKeys = map[string]string{
 // environment and the config file. Precedence, highest first: CLI flags,
 // environment variables, config file, defaults.
 func Load(args []string) (*Config, error) {
-	fs := pflag.NewFlagSet(appName, pflag.ContinueOnError)
-	fs.Usage = func() {}
-	fs.String("input", "", "Input motion photo file or directory path (*.jpg, *.jpeg, *.heic)")
-	fs.String("output", ".", "Directory to save extracted files")
-	fs.Bool("delete-orig", false, "Delete original file after successful extraction")
-	fs.Bool("rename-orig", false, "Rename original file and don't append _photo/_video to extracted files")
-	fs.Bool("extract-photo", true, "Extract photo part")
-	fs.Bool("extract-video", true, "Extract video part")
-	fs.Bool("force", false, "Force overwrite existing files")
-	fs.String("log-file", "", "Log to file")
-	fs.String("log-level", "info", "Log level (debug, info, warn, error)")
-	fs.Bool("no-console-log", false, "Disable console logging")
-	configFile := fs.String("config", "", "Config file path (optional)")
-	showVersion := fs.Bool("version", false, "Print version and exit")
+	var file struct {
+		Input  string `yaml:"input"`
+		Config `yaml:",inline"`
+	}
+	cfg := &file.Config
 
-	if err := fs.Parse(args); err != nil {
+	flags := pflag.NewFlagSet(appName, pflag.ContinueOnError)
+	flags.Usage = func() {}
+	flags.StringVar(&file.Input, "input", "", "Input motion photo file or directory path (*.jpg, *.jpeg, *.heic)")
+	flags.StringVar(&cfg.OutputDir, "output", ".", "Directory to save extracted files")
+	flags.BoolVar(&cfg.DeleteOrig, "delete-orig", false, "Delete original file after successful extraction")
+	flags.BoolVar(&cfg.RenameOrig, "rename-orig", false, "Rename original file and don't append _photo/_video to extracted files")
+	flags.BoolVar(&cfg.ExtractPhoto, "extract-photo", true, "Extract photo part")
+	flags.BoolVar(&cfg.ExtractVideo, "extract-video", true, "Extract video part")
+	flags.BoolVar(&cfg.Force, "force", false, "Force overwrite existing files")
+	flags.StringVar(&cfg.Log.File, "log-file", "", "Log to file")
+	flags.StringVar(&cfg.Log.Level, "log-level", "info", "Log level (debug, info, warn, error)")
+	flags.BoolVar(&cfg.Log.NoConsole, "no-console-log", false, "Disable console logging")
+	flags.BoolVar(&cfg.ShowVersion, "version", false, "Print version and exit")
+	configFile := flags.String("config", "", "Config file path (optional)")
+
+	if err := flags.Parse(args); err != nil {
 		return nil, err
 	}
 
-	v := viper.New()
+	// cfg now holds the defaults overlaid with the command line. The config
+	// file and the environment rank in between, so they are applied on top
+	// and the command line values are then put back.
+	fromCLI := make(map[string]string)
+	flags.Visit(func(f *pflag.Flag) {
+		fromCLI[f.Name] = f.Value.String()
+	})
+
+	data, err := readConfigFile(*configFile)
+	if err == nil {
+		err = yaml.Unmarshal(data, &file)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
 	for flagName, key := range flagKeys {
-		if err := v.BindPFlag(key, fs.Lookup(flagName)); err != nil {
-			return nil, fmt.Errorf("failed to bind CLI flags: %w", err)
+		name := envName(key)
+		value := os.Getenv(name)
+		if value == "" {
+			continue
+		}
+		if err := flags.Set(flagName, value); err != nil {
+			return nil, fmt.Errorf("invalid %s: %w", name, err)
 		}
 	}
 
-	v.SetEnvPrefix(envPrefix)
-	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
-	v.AutomaticEnv()
-
-	if *configFile != "" {
-		v.SetConfigFile(*configFile)
-	} else {
-		v.SetConfigName(appName)
-		v.AddConfigPath(".")
-		v.AddConfigPath("$HOME/.config/" + appName)
-	}
-
-	if err := v.ReadInConfig(); err != nil {
-		if _, ok := errors.AsType[viper.ConfigFileNotFoundError](err); !ok {
-			return nil, fmt.Errorf("failed to read config file: %w", err)
+	for flagName, value := range fromCLI {
+		if err := flags.Set(flagName, value); err != nil {
+			return nil, err
 		}
 	}
 
-	cfg := Config{ShowVersion: *showVersion}
-	if err := v.Unmarshal(&cfg); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal configuration: %w", err)
+	_, inputFromCLI := fromCLI["input"]
+	switch {
+	case inputFromCLI:
+		cfg.Inputs = []string{file.Input}
+	case flags.NArg() > 0:
+		cfg.Inputs = flags.Args()
+	case file.Input != "":
+		cfg.Inputs = []string{file.Input}
 	}
 
-	switch input := v.GetString("input"); {
-	case fs.Changed("input"):
-		cfg.Inputs = []string{input}
-	case fs.NArg() > 0:
-		cfg.Inputs = fs.Args()
-	case input != "":
-		cfg.Inputs = []string{input}
+	return cfg, nil
+}
+
+// readConfigFile returns the contents of the config file at path, or of the
+// first one found in the default locations when path is empty. Not finding
+// one in the default locations is not an error.
+func readConfigFile(path string) ([]byte, error) {
+	if path != "" {
+		return os.ReadFile(path)
 	}
 
-	return &cfg, nil
+	dirs := []string{"."}
+	if home, err := os.UserHomeDir(); err == nil {
+		dirs = append(dirs, filepath.Join(home, ".config", appName))
+	}
+
+	for _, dir := range dirs {
+		for _, ext := range []string{".yaml", ".yml"} {
+			data, err := os.ReadFile(filepath.Join(dir, appName+ext))
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return data, err
+		}
+	}
+
+	return nil, nil
+}
+
+func envName(key string) string {
+	return envPrefix + "_" + strings.ToUpper(strings.ReplaceAll(key, ".", "_"))
 }

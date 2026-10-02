@@ -46,3 +46,15 @@ func loadError(t *testing.T, dir string, args ...string) error {
 	_, err := config.Load(args)
 	return err
 }
+
+func TestLoadReturnsErrorForInvalidEnvironmentValue(t *testing.T) {
+	t.Setenv("GO_MOTION_PHOTO_FORCE", "maybe")
+
+	err := loadError(t, t.TempDir(), "photo.jpg")
+	if err == nil {
+		t.Fatal("Load() error = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "GO_MOTION_PHOTO_FORCE") {
+		t.Fatalf("Load() error = %q, want to name the variable", err.Error())
+	}
+}
