@@ -93,3 +93,31 @@ func TestLoadReturnsErrorForInvalidEnvironmentValue(t *testing.T) {
 		t.Fatalf("Load() error = %q, want to name the variable", err.Error())
 	}
 }
+
+func TestLoadSuggestsFlagForTypo(t *testing.T) {
+	tests := []struct {
+		arg  string
+		want string
+	}{
+		{arg: "--ouput", want: "did you mean --output?"},
+		{arg: "--delete-original", want: ""},
+		{arg: "--nope", want: ""},
+		{arg: "-x", want: ""},
+	}
+
+	for _, tc := range tests {
+		err := loadError(t, t.TempDir(), tc.arg, "photo.jpg")
+		if err == nil {
+			t.Fatalf("Load(%s) error = nil, want non-nil", tc.arg)
+		}
+		if got := strings.Contains(err.Error(), "did you mean"); got != (tc.want != "") || !strings.Contains(err.Error(), tc.want) {
+			t.Fatalf("Load(%s) error = %q, want suggestion %q", tc.arg, err.Error(), tc.want)
+		}
+	}
+}
+
+func TestLoadRejectsVerboseWithQuiet(t *testing.T) {
+	if err := loadError(t, t.TempDir(), "-v", "-q", "photo.jpg"); err == nil {
+		t.Fatal("Load() error = nil, want non-nil")
+	}
+}

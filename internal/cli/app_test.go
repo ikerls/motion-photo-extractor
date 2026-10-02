@@ -19,7 +19,7 @@ func TestProcessSingleFile(t *testing.T) {
 	output := filepath.Join(tempDir, "out")
 	writeMotionPhotoFixture(t, input)
 
-	if err := process(testConfig(output, input), discardLogger()); err != nil {
+	if err := process(t.Context(), testConfig(output, input), discardReporter()); err != nil {
 		t.Fatalf("process() error = %v", err)
 	}
 
@@ -36,7 +36,7 @@ func TestProcessSingleFileWithoutVideoExtraction(t *testing.T) {
 	cfg := testConfig(output, input)
 	cfg.ExtractVideo = false
 
-	if err := process(cfg, discardLogger()); err != nil {
+	if err := process(t.Context(), cfg, discardReporter()); err != nil {
 		t.Fatalf("process() error = %v", err)
 	}
 
@@ -50,7 +50,7 @@ func TestProcessSingleFileRejectsFalsePositive(t *testing.T) {
 	output := filepath.Join(tempDir, "out")
 	writeFalsePositiveFixture(t, input)
 
-	err := process(testConfig(output, input), discardLogger())
+	err := process(t.Context(), testConfig(output, input), discardReporter())
 	if err == nil {
 		t.Fatal("process() error = nil, want non-nil")
 	}
@@ -67,7 +67,7 @@ func TestProcessSeveralInputs(t *testing.T) {
 	writeMotionPhotoFixture(t, first)
 	writeMotionPhotoFixture(t, second)
 
-	if err := process(testConfig(output, first, second), discardLogger()); err != nil {
+	if err := process(t.Context(), testConfig(output, first, second), discardReporter()); err != nil {
 		t.Fatalf("process() error = %v", err)
 	}
 
@@ -89,7 +89,7 @@ func TestProcessDirectoryProcessesSupportedFiles(t *testing.T) {
 		t.Fatalf("write skip file: %v", err)
 	}
 
-	if err := process(testConfig(output, inputDir), discardLogger()); err != nil {
+	if err := process(t.Context(), testConfig(output, inputDir), discardReporter()); err != nil {
 		t.Fatalf("process() error = %v", err)
 	}
 
@@ -111,7 +111,7 @@ func TestProcessDirectorySkipsFilesThatAreNotMotionPhotos(t *testing.T) {
 	writeMotionPhotoFixture(t, filepath.Join(inputDir, "motion.jpg"))
 	writeFalsePositiveFixture(t, filepath.Join(inputDir, "plain.jpg"))
 
-	if err := process(testConfig(output, inputDir), discardLogger()); err != nil {
+	if err := process(t.Context(), testConfig(output, inputDir), discardReporter()); err != nil {
 		t.Fatalf("process() error = %v", err)
 	}
 
@@ -125,7 +125,7 @@ func TestProcessBatchReportsFailures(t *testing.T) {
 	good := filepath.Join(tempDir, "good.jpg")
 	writeMotionPhotoFixture(t, good)
 
-	err := process(testConfig(output, good, filepath.Join(tempDir, "missing.jpg")), discardLogger())
+	err := process(t.Context(), testConfig(output, good, filepath.Join(tempDir, "missing.jpg")), discardReporter())
 	if err == nil {
 		t.Fatal("process() error = nil, want non-nil")
 	}
@@ -142,7 +142,7 @@ func TestProcessGlobPattern(t *testing.T) {
 		t.Fatalf("write png fixture: %v", err)
 	}
 
-	if err := process(testConfig(output, filepath.Join(tempDir, "g*")), discardLogger()); err != nil {
+	if err := process(t.Context(), testConfig(output, filepath.Join(tempDir, "g*")), discardReporter()); err != nil {
 		t.Fatalf("process() error = %v", err)
 	}
 
@@ -161,7 +161,7 @@ func TestProcessRegexPattern(t *testing.T) {
 	writeMotionPhotoFixture(t, filepath.Join(tempDir, "OTHER_0003.jpg"))
 
 	t.Chdir(tempDir)
-	if err := process(testConfig(output, `/IMG_\d{4}\.jpg/`), discardLogger()); err != nil {
+	if err := process(t.Context(), testConfig(output, `/IMG_\d{4}\.jpg/`), discardReporter()); err != nil {
 		t.Fatalf("process() error = %v", err)
 	}
 
@@ -173,14 +173,14 @@ func TestProcessRegexPattern(t *testing.T) {
 }
 
 func TestProcessInvalidRegexReturnsError(t *testing.T) {
-	err := process(testConfig(t.TempDir(), `/[unterminated/`), discardLogger())
+	err := process(t.Context(), testConfig(t.TempDir(), `/[unterminated/`), discardReporter())
 	if err == nil {
 		t.Fatal("process() error = nil, want non-nil")
 	}
 }
 
 func TestProcessInvalidGlobReturnsError(t *testing.T) {
-	err := process(testConfig(t.TempDir(), "["), discardLogger())
+	err := process(t.Context(), testConfig(t.TempDir(), "["), discardReporter())
 	if err == nil {
 		t.Fatal("process() error = nil, want non-nil")
 	}
@@ -244,8 +244,8 @@ func testConfig(output string, inputs ...string) *config.Config {
 	}
 }
 
-func discardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+func discardReporter() *reporter {
+	return &reporter{log: slog.New(slog.DiscardHandler), out: newConsole(io.Discard, slog.LevelInfo)}
 }
 
 func writeMotionPhotoFixture(t *testing.T, path string) {

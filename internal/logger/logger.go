@@ -1,3 +1,5 @@
+// Package logger builds the structured logger behind --log-file and the
+// non-interactive console output.
 package logger
 
 import (
@@ -6,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/log"
@@ -16,60 +19,20 @@ type Options struct {
 	Console io.Writer
 	// File is appended to when set. Its directory is created if missing.
 	File string
-	// Level is one of debug, info, warn, error.
-	Level string
-}
-
-func getCustomStyles() *log.Styles {
-	styles := log.DefaultStyles()
-
-	styles.Levels = map[log.Level]lipgloss.Style{
-		log.DebugLevel: lipgloss.NewStyle().
-			SetString("DEBUG").
-			Padding(0, 1).
-			Background(lipgloss.Color("8")).
-			Foreground(lipgloss.Color("15")),
-		log.InfoLevel: lipgloss.NewStyle().
-			SetString("INFO").
-			Padding(0, 1).
-			Background(lipgloss.Color("39")).
-			Foreground(lipgloss.Color("15")),
-		log.WarnLevel: lipgloss.NewStyle().
-			SetString("WARN").
-			Padding(0, 1).
-			Background(lipgloss.Color("220")).
-			Foreground(lipgloss.Color("0")),
-		log.ErrorLevel: lipgloss.NewStyle().
-			SetString("ERROR").
-			Padding(0, 1).
-			Background(lipgloss.Color("196")).
-			Foreground(lipgloss.Color("15")),
-		log.FatalLevel: lipgloss.NewStyle().
-			SetString("FATAL").
-			Padding(0, 1).
-			Background(lipgloss.Color("88")).
-			Foreground(lipgloss.Color("15")),
-	}
-
-	styles.Timestamp = lipgloss.NewStyle().Foreground(lipgloss.Color("246"))
-	styles.Message = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
-
-	return styles
+	// Level is the lowest level that is logged.
+	Level slog.Level
+	// JSON writes one JSON object per line instead of text.
+	JSON bool
 }
 
 // New builds a logger writing to the console and/or a file. The returned
 // function closes the log file, if any, and must be called when done.
 func New(opts Options) (*slog.Logger, func() error, error) {
-	level, err := parseLogLevel(opts.Level)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	var writers []io.Writer
+	var handlers []slog.Handler
 	closeFn := func() error { return nil }
 
 	if opts.Console != nil {
-		writers = append(writers, opts.Console)
+		handlers = append(handlers, newHandler(opts.Console, opts))
 	}
 
 	if opts.File != "" {
@@ -81,40 +44,71 @@ func New(opts Options) (*slog.Logger, func() error, error) {
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to open log file: %w", err)
 		}
-		writers = append(writers, f)
+		handlers = append(handlers, newHandler(f, opts))
 		closeFn = f.Close
 	}
 
-	var writer io.Writer
-	switch len(writers) {
+	switch len(handlers) {
 	case 0:
-		writer = io.Discard
+		return slog.New(slog.DiscardHandler), closeFn, nil
 	case 1:
-		writer = writers[0]
+		return slog.New(handlers[0]), closeFn, nil
 	default:
-		writer = io.MultiWriter(writers...)
+		return slog.New(slog.NewMultiHandler(handlers...)), closeFn, nil
 	}
-
-	handler := log.NewWithOptions(writer, log.Options{
-		Level:           level,
-		ReportTimestamp: true,
-	})
-	handler.SetStyles(getCustomStyles())
-
-	return slog.New(handler), closeFn, nil
 }
 
-func parseLogLevel(level string) (log.Level, error) {
+// newHandler gives each destination its own handler, so that a terminal gets
+// colors while a file written alongside it stays plain.
+func newHandler(w io.Writer, opts Options) slog.Handler {
+	logOpts := log.Options{
+		Level:           log.Level(opts.Level),
+		ReportTimestamp: true,
+		TimeFormat:      time.DateTime,
+	}
+	if opts.JSON {
+		logOpts.Formatter = log.JSONFormatter
+		logOpts.TimeFormat = time.RFC3339
+	}
+
+	handler := log.NewWithOptions(w, logOpts)
+	handler.SetStyles(styles())
+	return handler
+}
+
+// styles uses the terminal's own 16 colors, which stay readable on both dark
+// and light backgrounds.
+func styles() *log.Styles {
+	styles := log.DefaultStyles()
+
+	level := func(name, color string) lipgloss.Style {
+		return lipgloss.NewStyle().SetString(name).Bold(true).Foreground(lipgloss.Color(color))
+	}
+	styles.Levels = map[log.Level]lipgloss.Style{
+		log.DebugLevel: level("DEBUG", "8"),
+		log.InfoLevel:  level("INFO ", "4"),
+		log.WarnLevel:  level("WARN ", "3"),
+		log.ErrorLevel: level("ERROR", "1"),
+		log.FatalLevel: level("FATAL", "5"),
+	}
+	styles.Timestamp = lipgloss.NewStyle().Faint(true)
+	styles.Key = lipgloss.NewStyle().Foreground(lipgloss.Color("6"))
+
+	return styles
+}
+
+// ParseLevel converts a --log-level value.
+func ParseLevel(level string) (slog.Level, error) {
 	switch level {
 	case "debug":
-		return log.DebugLevel, nil
+		return slog.LevelDebug, nil
 	case "info":
-		return log.InfoLevel, nil
+		return slog.LevelInfo, nil
 	case "warn":
-		return log.WarnLevel, nil
+		return slog.LevelWarn, nil
 	case "error":
-		return log.ErrorLevel, nil
+		return slog.LevelError, nil
 	default:
-		return log.InfoLevel, fmt.Errorf("invalid log level: %s", level)
+		return slog.LevelInfo, fmt.Errorf("invalid log level %q: use debug, info, warn or error", level)
 	}
 }

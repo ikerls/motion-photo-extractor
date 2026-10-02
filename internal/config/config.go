@@ -44,8 +44,10 @@ type Config struct {
 }
 
 type LogConfig struct {
-	File      string `yaml:"file"`
-	Level     string `yaml:"level"`
+	File  string `yaml:"file"`
+	Level string `yaml:"level"`
+	// Format is one of auto, pretty, text, json.
+	Format    string `yaml:"format"`
 	NoConsole bool   `yaml:"no_console"`
 }
 
@@ -63,58 +65,6 @@ var (
 	legacyExts = []string{".toml", ".hcl", ".tfvars", ".ini", ".properties", ".props", ".prop", ".env", ".dotenv"}
 )
 
-const Usage = `Usage: go-motion-photo [options] <file|directory|pattern>...
-
-Arguments:
-  <file>...            One or more motion photo files, directories or patterns
-
-Input Options:
-  --input <path>       Path to a motion photo file or directory with supported files
-                       Supported formats: .jpg, .jpeg, .heic
-                       Glob patterns are expanded: 'photos/*.jpg'
-                       For regex patterns, enclose pattern in forward slashes: /pattern/
-                       (matched against file names in the current directory)
-
-Output Options:
-  --output <dir>       Directory to save extracted files (default: ".")
-  --delete-orig        Delete original file after successful extraction
-  --rename-orig        Rename original file instead of adding suffixes to extracted files
-                       (Original gets _original suffix, extracted files use base name)
-  --extract-photo      Extract the photo component (default: true)
-  --extract-video      Extract the video component (default: true)
-  --force              Force overwrite of existing output files
-
-Logging Options:
-  --log-file <path>    Path to log file (if not specified, logs to console only)
-  --log-level <level>  Log level: debug, info, warn, error (default: "info")
-  --no-console-log     Disable console logging (only log to file if specified)
-
-Configuration:
-  --config <path>      Path to configuration file, YAML or JSON
-                       When not specified, searches for 'go-motion-photo.yaml',
-                       '.yml' or '.json' in:
-                       - Current directory
-                       - $HOME/.config/go-motion-photo
-                       Every config key can also be set through the environment,
-                       e.g. GO_MOTION_PHOTO_OUTPUT, GO_MOTION_PHOTO_LOG_LEVEL
-
-Other:
-  --version            Print version and exit
-  --help               Show this help
-
-When more than one file is processed, files that are not motion photos are skipped.
-The exit status is 1 if any file failed.
-
-Examples:
-  go-motion-photo photo.jpg                                # Process single file
-  go-motion-photo a.jpg b.jpg c.heic                       # Process several files
-  go-motion-photo --input photo.jpg --output ./extracted   # Specify output location
-  go-motion-photo --input ./photos                         # Process all supported files in directory
-  go-motion-photo --input /IMG_\d{4}\.jpg/                 # Process files matching regex pattern
-  go-motion-photo --input photo.jpg --rename-orig          # Keep original naming scheme
-  go-motion-photo --input photo.jpg --extract-video=false  # Extract only photo component
-  go-motion-photo --input photo.heic --force               # Process HEIC file and overwrite existing outputs`
-
 // flagKeys maps each CLI flag to the config key it sets. The key also names
 // the environment variable: log.level is read from GO_MOTION_PHOTO_LOG_LEVEL.
 var flagKeys = map[string]string{
@@ -127,6 +77,7 @@ var flagKeys = map[string]string{
 	"force":          "force",
 	"log-file":       "log.file",
 	"log-level":      "log.level",
+	"log-format":     "log.format",
 	"no-console-log": "log.no_console",
 }
 
@@ -142,21 +93,24 @@ func Load(args []string) (*Config, error) {
 
 	flags := pflag.NewFlagSet(appName, pflag.ContinueOnError)
 	flags.Usage = func() {}
-	flags.StringVar(&file.Input, "input", "", "Input motion photo file or directory path (*.jpg, *.jpeg, *.heic)")
-	flags.StringVar(&cfg.OutputDir, "output", ".", "Directory to save extracted files")
+	flags.StringVarP(&file.Input, "input", "i", "", "Input motion photo file or directory path (*.jpg, *.jpeg, *.heic)")
+	flags.StringVarP(&cfg.OutputDir, "output", "o", ".", "Directory to save extracted files")
 	flags.BoolVar(&cfg.DeleteOrig, "delete-orig", false, "Delete original file after successful extraction")
 	flags.BoolVar(&cfg.RenameOrig, "rename-orig", false, "Rename original file and don't append _photo/_video to extracted files")
 	flags.BoolVar(&cfg.ExtractPhoto, "extract-photo", true, "Extract photo part")
 	flags.BoolVar(&cfg.ExtractVideo, "extract-video", true, "Extract video part")
-	flags.BoolVar(&cfg.Force, "force", false, "Force overwrite existing files")
+	flags.BoolVarP(&cfg.Force, "force", "f", false, "Force overwrite existing files")
 	flags.StringVar(&cfg.Log.File, "log-file", "", "Log to file")
 	flags.StringVar(&cfg.Log.Level, "log-level", "info", "Log level (debug, info, warn, error)")
+	flags.StringVar(&cfg.Log.Format, "log-format", "auto", "Console output format (auto, pretty, text, json)")
 	flags.BoolVar(&cfg.Log.NoConsole, "no-console-log", false, "Disable console logging")
-	flags.BoolVar(&cfg.ShowVersion, "version", false, "Print version and exit")
+	flags.BoolVarP(&cfg.ShowVersion, "version", "V", false, "Print version and exit")
+	verbose := flags.BoolP("verbose", "v", false, "Same as --log-level debug")
+	quiet := flags.BoolP("quiet", "q", false, "Same as --log-level warn")
 	configFile := flags.String("config", "", "Config file path (optional)")
 
 	if err := flags.Parse(args); err != nil {
-		return nil, err
+		return nil, withSuggestion(err, flags)
 	}
 
 	// cfg now holds the defaults overlaid with the command line. The config
@@ -192,6 +146,15 @@ func Load(args []string) (*Config, error) {
 		if err := flags.Set(flagName, value); err != nil {
 			return nil, err
 		}
+	}
+
+	switch {
+	case *verbose && *quiet:
+		return nil, errors.New("--verbose and --quiet cannot be used together")
+	case *verbose:
+		cfg.Log.Level = "debug"
+	case *quiet:
+		cfg.Log.Level = "warn"
 	}
 
 	_, inputFromCLI := fromCLI["input"]
@@ -261,6 +224,46 @@ func decodeConfig(path string, data []byte, v any) error {
 		}
 	}
 	return yaml.Unmarshal(data, v)
+}
+
+// withSuggestion adds the closest flag name to an unknown flag error.
+func withSuggestion(err error, flags *pflag.FlagSet) error {
+	var unknown *pflag.NotExistError
+	if !errors.As(err, &unknown) || unknown.GetSpecifiedShortnames() != "" {
+		return err
+	}
+
+	name := unknown.GetSpecifiedName()
+	best, bestDistance := "", 3
+	flags.VisitAll(func(f *pflag.Flag) {
+		if d := editDistance(name, f.Name); d < bestDistance {
+			best, bestDistance = f.Name, d
+		}
+	})
+	if best == "" {
+		return err
+	}
+	return fmt.Errorf("%w, did you mean --%s?", err, best)
+}
+
+// editDistance is the Levenshtein distance between a and b.
+func editDistance(a, b string) int {
+	row := make([]int, len(b)+1)
+	for j := range row {
+		row[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		diagonal := row[0]
+		row[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			diagonal, row[j] = row[j], min(row[j]+1, row[j-1]+1, diagonal+cost)
+		}
+	}
+	return row[len(b)]
 }
 
 func envName(key string) string {

@@ -2,70 +2,139 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"os/signal"
+	"time"
 
 	"github.com/ikerls/motion-photo-extractor/internal/config"
 	"github.com/ikerls/motion-photo-extractor/internal/logger"
 	"github.com/ikerls/motion-photo-extractor/pkg/extractor"
 )
 
+// exitInterrupted is the conventional exit status after SIGINT.
+const exitInterrupted = 130
+
+var (
+	// errFilesFailed and errInterrupted end a run whose outcome the reporter
+	// has already described.
+	errFilesFailed = errors.New("files failed")
+	errInterrupted = errors.New("interrupted")
+)
+
 // Run executes the command with args (without the program name) and returns
 // the process exit status.
 func Run(args []string, stdout, stderr io.Writer, version string) int {
+	// Mistakes in the invocation are always shown, whatever the log options.
+	usage := newConsole(stderr, slog.LevelInfo)
+
 	cfg, err := config.Load(args)
 	if errors.Is(err, config.ErrHelp) {
-		fmt.Fprintln(stdout, config.Usage)
+		printHelp(stdout)
 		return 0
 	}
 	if err != nil {
-		fmt.Fprintf(stderr, "Error: %v\nUse --help for more information\n", err)
+		usage.failure(err, helpHint)
 		return 1
 	}
 
 	if cfg.ShowVersion {
-		fmt.Fprintf(stdout, "go-motion-photo %s\n", version)
+		fmt.Fprintf(stdout, "%s %s\n", appName, version)
 		return 0
 	}
 
-	logOpts := logger.Options{File: cfg.Log.File, Level: cfg.Log.Level}
-	if !cfg.Log.NoConsole {
-		logOpts.Console = stderr
-	}
-	log, closeLog, err := logger.New(logOpts)
+	rep, closeLog, err := newReporter(cfg, stderr)
 	if err != nil {
-		fmt.Fprintf(stderr, "Failed to setup logger: %v\n", err)
+		usage.failure(err, helpHint)
 		return 1
 	}
 	defer closeLog()
 
+	if cfg.ConfigFile != "" {
+		rep.usingConfig(cfg.ConfigFile)
+	}
 	if len(cfg.Inputs) == 0 {
-		log.Error("No input file specified")
-		log.Info("Use --help for more information")
+		usage.failure(errors.New("no input specified"), usageLine, helpHint)
 		return 1
 	}
 
-	if err := process(cfg, log); err != nil {
-		log.Error(err.Error())
+	// The first interrupt stops the run after the file being processed, so
+	// that no half-written output is left behind. A second one kills it.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	context.AfterFunc(ctx, stop)
+
+	switch err := process(ctx, cfg, rep); {
+	case err == nil:
+		return 0
+	case errors.Is(err, errInterrupted):
+		return exitInterrupted
+	case errors.Is(err, errFilesFailed):
+		return 1
+	default:
+		rep.fatal(err)
 		return 1
 	}
-	return 0
+}
+
+// newReporter sets up the output chosen by the log options: either the
+// human-readable console or structured logs on stderr, plus the log file.
+// The returned function closes the log file, if any.
+func newReporter(cfg *config.Config, stderr io.Writer) (*reporter, func() error, error) {
+	level, err := logger.ParseLevel(cfg.Log.Level)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var pretty bool
+	switch cfg.Log.Format {
+	case "auto":
+		pretty = isTerminal(stderr)
+	case "pretty":
+		pretty = true
+	case "text", "json":
+	default:
+		return nil, nil, fmt.Errorf("invalid log format %q: use auto, pretty, text or json", cfg.Log.Format)
+	}
+
+	out := newConsole(io.Discard, level)
+	logOpts := logger.Options{File: cfg.Log.File, Level: level, JSON: cfg.Log.Format == "json"}
+	switch {
+	case cfg.Log.NoConsole:
+	case pretty:
+		out = newConsole(stderr, level)
+	default:
+		logOpts.Console = stderr
+	}
+
+	log, closeLog, err := logger.New(logOpts)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &reporter{log: log, out: out}, closeLog, nil
 }
 
 // process extracts every file designated by cfg.Inputs. It keeps going after
-// a file fails and reports the failures in the returned error.
-func process(cfg *config.Config, log *slog.Logger) error {
+// a file fails and returns errFilesFailed once all of them were tried.
+func process(ctx context.Context, cfg *config.Config, rep *reporter) error {
+	if !cfg.ExtractPhoto && !cfg.ExtractVideo {
+		return extractor.ErrNothingToExtract
+	}
+
 	var files []string
 	explicit := true
 	for _, input := range cfg.Inputs {
+		rep.scanning(input)
 		found, isExplicit, err := resolveInput(input)
 		if err != nil {
 			return err
 		}
 		if !isExplicit {
-			log.Info("Resolved input", "input", input, "files", len(found))
+			rep.resolved(input, len(found))
 		}
 		files = append(files, found...)
 		explicit = explicit && isExplicit
@@ -84,56 +153,34 @@ func process(cfg *config.Config, log *slog.Logger) error {
 	// that are not motion photos are expected and skipped.
 	strict := explicit && len(files) == 1
 
-	var extracted, skipped, failed int
-	for _, file := range files {
+	rep.begin(files)
+	start := time.Now()
+	interrupted := false
+	for i, file := range files {
+		if ctx.Err() != nil {
+			interrupted = true
+			break
+		}
+		rep.processing(i, file)
+
 		res, err := extractor.ExtractFile(file, opts)
 		switch {
 		case err == nil:
-			extracted++
-			report(log, file, res)
+			rep.extractedFile(file, res)
 		case !strict && errors.Is(err, extractor.ErrNotMotionPhoto):
-			skipped++
-			log.Debug("Skipped, not a motion photo", "file", file, "reason", err)
-		case strict:
-			return fmt.Errorf("%s: %w", file, err)
+			rep.skippedFile(file, err)
 		default:
-			failed++
-			log.Error("Extraction failed", "file", file, "err", err)
+			rep.failedFile(file, err)
 		}
 	}
+	rep.finish(cfg.OutputDir, time.Since(start), interrupted)
 
-	if !strict {
-		log.Info("Done", "extracted", extracted, "skipped", skipped, "failed", failed)
-	}
-	if failed > 0 {
-		return fmt.Errorf("%d of %d files failed", failed, len(files))
-	}
-	return nil
-}
-
-func report(log *slog.Logger, file string, res extractor.Result) {
-	for _, path := range res.Skipped {
-		log.Warn("Output already exists, not overwritten (use --force)", "path", path)
-	}
-
-	attrs := []any{"file", file}
-	if res.PhotoPath != "" {
-		attrs = append(attrs, "photo", res.PhotoPath)
-	}
-	if res.VideoPath != "" {
-		attrs = append(attrs, "video", res.VideoPath)
-	}
-	switch res.OriginalPath {
-	case file:
-	case "":
-		attrs = append(attrs, "original", "deleted")
+	switch {
+	case interrupted:
+		return errInterrupted
+	case rep.failed > 0:
+		return errFilesFailed
 	default:
-		attrs = append(attrs, "original", res.OriginalPath)
+		return nil
 	}
-	if res.PhotoPath == "" && res.VideoPath == "" {
-		log.Info("Nothing written", attrs...)
-	} else {
-		log.Info("Extracted", attrs...)
-	}
-	log.Debug("Split point located", "file", file, "method", string(res.Method))
 }
