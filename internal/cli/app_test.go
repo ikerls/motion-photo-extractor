@@ -1,70 +1,81 @@
-package main
+package cli
 
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ikerls/motion-photo-extractor/internal/config"
-	"github.com/ikerls/motion-photo-extractor/pkg/extractor"
 )
 
-func TestProcessInputsSingleFile(t *testing.T) {
+func TestProcessSingleFile(t *testing.T) {
 	tempDir := t.TempDir()
 	input := filepath.Join(tempDir, "single.jpg")
 	output := filepath.Join(tempDir, "out")
 	writeMotionPhotoFixture(t, input)
 
-	cfg := testConfig(input, output)
-	e := extractor.New()
-
-	if err := processInputs(cfg, e); err != nil {
-		t.Fatalf("processInputs() error = %v", err)
+	if err := process(testConfig(output, input), discardLogger()); err != nil {
+		t.Fatalf("process() error = %v", err)
 	}
 
 	assertFileExists(t, filepath.Join(output, "single_photo.jpg"))
 	assertFileExists(t, filepath.Join(output, "single_video.mp4"))
 }
 
-func TestProcessInputsSingleFileWithoutVideoExtraction(t *testing.T) {
+func TestProcessSingleFileWithoutVideoExtraction(t *testing.T) {
 	tempDir := t.TempDir()
 	input := filepath.Join(tempDir, "single.jpg")
 	output := filepath.Join(tempDir, "out")
 	writeMotionPhotoFixture(t, input)
 
-	cfg := testConfig(input, output)
+	cfg := testConfig(output, input)
 	cfg.ExtractVideo = false
-	e := extractor.New()
 
-	if err := processInputs(cfg, e); err != nil {
-		t.Fatalf("processInputs() error = %v", err)
+	if err := process(cfg, discardLogger()); err != nil {
+		t.Fatalf("process() error = %v", err)
 	}
 
 	assertFileExists(t, filepath.Join(output, "single_photo.jpg"))
 	assertFileDoesNotExist(t, filepath.Join(output, "single_video.mp4"))
 }
 
-func TestProcessInputsSingleFileRejectsFalsePositive(t *testing.T) {
+func TestProcessSingleFileRejectsFalsePositive(t *testing.T) {
 	tempDir := t.TempDir()
 	input := filepath.Join(tempDir, "false-positive.jpg")
 	output := filepath.Join(tempDir, "out")
 	writeFalsePositiveFixture(t, input)
 
-	cfg := testConfig(input, output)
-	e := extractor.New()
-
-	err := processInputs(cfg, e)
+	err := process(testConfig(output, input), discardLogger())
 	if err == nil {
-		t.Fatal("processInputs() error = nil, want non-nil")
+		t.Fatal("process() error = nil, want non-nil")
 	}
 
 	assertFileDoesNotExist(t, filepath.Join(output, "false-positive_photo.jpg"))
 	assertFileDoesNotExist(t, filepath.Join(output, "false-positive_video.mp4"))
 }
 
-func TestProcessInputsDirectoryProcessesSupportedFiles(t *testing.T) {
+func TestProcessSeveralInputs(t *testing.T) {
+	tempDir := t.TempDir()
+	output := filepath.Join(tempDir, "out")
+	first := filepath.Join(tempDir, "first.jpg")
+	second := filepath.Join(tempDir, "second.jpg")
+	writeMotionPhotoFixture(t, first)
+	writeMotionPhotoFixture(t, second)
+
+	if err := process(testConfig(output, first, second), discardLogger()); err != nil {
+		t.Fatalf("process() error = %v", err)
+	}
+
+	assertFileExists(t, filepath.Join(output, "first_video.mp4"))
+	assertFileExists(t, filepath.Join(output, "second_video.mp4"))
+}
+
+func TestProcessDirectoryProcessesSupportedFiles(t *testing.T) {
 	tempDir := t.TempDir()
 	inputDir := filepath.Join(tempDir, "in")
 	output := filepath.Join(tempDir, "out")
@@ -78,11 +89,8 @@ func TestProcessInputsDirectoryProcessesSupportedFiles(t *testing.T) {
 		t.Fatalf("write skip file: %v", err)
 	}
 
-	cfg := testConfig(inputDir, output)
-	e := extractor.New()
-
-	if err := processInputs(cfg, e); err != nil {
-		t.Fatalf("processInputs() error = %v", err)
+	if err := process(testConfig(output, inputDir), discardLogger()); err != nil {
+		t.Fatalf("process() error = %v", err)
 	}
 
 	assertFileExists(t, filepath.Join(output, "a_photo.jpg"))
@@ -92,7 +100,40 @@ func TestProcessInputsDirectoryProcessesSupportedFiles(t *testing.T) {
 	assertFileDoesNotExist(t, filepath.Join(output, "skip_video.mp4"))
 }
 
-func TestProcessInputsGlobPattern(t *testing.T) {
+func TestProcessDirectorySkipsFilesThatAreNotMotionPhotos(t *testing.T) {
+	tempDir := t.TempDir()
+	inputDir := filepath.Join(tempDir, "in")
+	output := filepath.Join(tempDir, "out")
+	if err := os.MkdirAll(inputDir, 0755); err != nil {
+		t.Fatalf("mkdir input dir: %v", err)
+	}
+
+	writeMotionPhotoFixture(t, filepath.Join(inputDir, "motion.jpg"))
+	writeFalsePositiveFixture(t, filepath.Join(inputDir, "plain.jpg"))
+
+	if err := process(testConfig(output, inputDir), discardLogger()); err != nil {
+		t.Fatalf("process() error = %v", err)
+	}
+
+	assertFileExists(t, filepath.Join(output, "motion_video.mp4"))
+	assertFileDoesNotExist(t, filepath.Join(output, "plain_video.mp4"))
+}
+
+func TestProcessBatchReportsFailures(t *testing.T) {
+	tempDir := t.TempDir()
+	output := filepath.Join(tempDir, "out")
+	good := filepath.Join(tempDir, "good.jpg")
+	writeMotionPhotoFixture(t, good)
+
+	err := process(testConfig(output, good, filepath.Join(tempDir, "missing.jpg")), discardLogger())
+	if err == nil {
+		t.Fatal("process() error = nil, want non-nil")
+	}
+
+	assertFileExists(t, filepath.Join(output, "good_video.mp4"))
+}
+
+func TestProcessGlobPattern(t *testing.T) {
 	tempDir := t.TempDir()
 	output := filepath.Join(tempDir, "out")
 	writeMotionPhotoFixture(t, filepath.Join(tempDir, "g1.jpg"))
@@ -101,11 +142,8 @@ func TestProcessInputsGlobPattern(t *testing.T) {
 		t.Fatalf("write png fixture: %v", err)
 	}
 
-	cfg := testConfig(filepath.Join(tempDir, "*.jpg"), output)
-	e := extractor.New()
-
-	if err := processInputs(cfg, e); err != nil {
-		t.Fatalf("processInputs() error = %v", err)
+	if err := process(testConfig(output, filepath.Join(tempDir, "g*")), discardLogger()); err != nil {
+		t.Fatalf("process() error = %v", err)
 	}
 
 	assertFileExists(t, filepath.Join(output, "g1_photo.jpg"))
@@ -115,21 +153,17 @@ func TestProcessInputsGlobPattern(t *testing.T) {
 	assertFileDoesNotExist(t, filepath.Join(output, "g3_video.mp4"))
 }
 
-func TestProcessInputsRegexPattern(t *testing.T) {
+func TestProcessRegexPattern(t *testing.T) {
 	tempDir := t.TempDir()
 	output := filepath.Join(tempDir, "out")
 	writeMotionPhotoFixture(t, filepath.Join(tempDir, "IMG_0001.jpg"))
 	writeMotionPhotoFixture(t, filepath.Join(tempDir, "IMG_0002.jpg"))
 	writeMotionPhotoFixture(t, filepath.Join(tempDir, "OTHER_0003.jpg"))
 
-	cfg := testConfig(`/IMG_\d{4}\.jpg/`, output)
-	e := extractor.New()
-
-	withWorkingDirectory(t, tempDir, func() {
-		if err := processInputs(cfg, e); err != nil {
-			t.Fatalf("processInputs() error = %v", err)
-		}
-	})
+	t.Chdir(tempDir)
+	if err := process(testConfig(output, `/IMG_\d{4}\.jpg/`), discardLogger()); err != nil {
+		t.Fatalf("process() error = %v", err)
+	}
 
 	assertFileExists(t, filepath.Join(output, "IMG_0001_photo.jpg"))
 	assertFileExists(t, filepath.Join(output, "IMG_0001_video.mp4"))
@@ -138,33 +172,80 @@ func TestProcessInputsRegexPattern(t *testing.T) {
 	assertFileDoesNotExist(t, filepath.Join(output, "OTHER_0003_video.mp4"))
 }
 
-func TestProcessInputsInvalidRegexReturnsError(t *testing.T) {
-	cfg := testConfig(`/[unterminated/`, t.TempDir())
-	e := extractor.New()
-
-	err := processInputs(cfg, e)
+func TestProcessInvalidRegexReturnsError(t *testing.T) {
+	err := process(testConfig(t.TempDir(), `/[unterminated/`), discardLogger())
 	if err == nil {
-		t.Fatal("processInputs() error = nil, want non-nil")
+		t.Fatal("process() error = nil, want non-nil")
 	}
 }
 
-func TestProcessInputsInvalidGlobReturnsError(t *testing.T) {
-	cfg := testConfig("[", t.TempDir())
-	e := extractor.New()
-
-	err := processInputs(cfg, e)
+func TestProcessInvalidGlobReturnsError(t *testing.T) {
+	err := process(testConfig(t.TempDir(), "["), discardLogger())
 	if err == nil {
-		t.Fatal("processInputs() error = nil, want non-nil")
+		t.Fatal("process() error = nil, want non-nil")
 	}
 }
 
-func testConfig(input, output string) *config.Config {
+func TestRunExitStatus(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Chdir(tempDir)
+	t.Setenv("HOME", tempDir)
+	motion := filepath.Join(tempDir, "motion.jpg")
+	plain := filepath.Join(tempDir, "plain.jpg")
+	writeMotionPhotoFixture(t, motion)
+	writeFalsePositiveFixture(t, plain)
+
+	tests := []struct {
+		name string
+		args []string
+		want int
+	}{
+		{name: "success", args: []string{"--output", filepath.Join(tempDir, "out"), motion}, want: 0},
+		{name: "not a motion photo", args: []string{plain}, want: 1},
+		{name: "no input", args: nil, want: 1},
+		{name: "unknown flag", args: []string{"--nope"}, want: 1},
+		{name: "invalid log level", args: []string{"--log-level", "loud", motion}, want: 1},
+		{name: "help", args: []string{"--help"}, want: 0},
+		{name: "version", args: []string{"--version"}, want: 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if got := Run(tc.args, &stdout, &stderr, "test"); got != tc.want {
+				t.Fatalf("Run(%q) = %d, want %d\nstdout: %s\nstderr: %s", tc.args, got, tc.want, &stdout, &stderr)
+			}
+		})
+	}
+}
+
+func TestRunPrintsHelpAndVersionToStdout(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var stdout, stderr bytes.Buffer
+	Run([]string{"--help"}, &stdout, &stderr, "1.2.3")
+	if !strings.Contains(stdout.String(), "Usage: go-motion-photo") || stderr.Len() != 0 {
+		t.Fatalf("--help: stdout = %q, stderr = %q", &stdout, &stderr)
+	}
+
+	stdout.Reset()
+	Run([]string{"--version"}, &stdout, &stderr, "1.2.3")
+	if got := stdout.String(); got != "go-motion-photo 1.2.3\n" {
+		t.Fatalf("--version: stdout = %q", got)
+	}
+}
+
+func testConfig(output string, inputs ...string) *config.Config {
 	return &config.Config{
-		InputFile:    input,
+		Inputs:       inputs,
 		OutputDir:    output,
 		ExtractPhoto: true,
 		ExtractVideo: true,
 	}
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 func writeMotionPhotoFixture(t *testing.T, path string) {
@@ -224,23 +305,6 @@ func buildFalsePositiveFixture() []byte {
 	data = append(data, bytes.Repeat([]byte{0x00}, 32)...)
 	data = append(data, []byte("mpvdnot-an-mp4-payload")...)
 	return data
-}
-
-func withWorkingDirectory(t *testing.T, dir string, fn func()) {
-	t.Helper()
-	originalDir, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
-	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("chdir: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := os.Chdir(originalDir); err != nil {
-			t.Fatalf("restore chdir: %v", err)
-		}
-	})
-	fn()
 }
 
 func assertFileExists(t *testing.T, path string) {

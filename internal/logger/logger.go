@@ -2,13 +2,23 @@ package logger
 
 import (
 	"fmt"
-	"github.com/charmbracelet/lipgloss"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/log"
 )
+
+type Options struct {
+	// Console receives log output. Nil disables console logging.
+	Console io.Writer
+	// File is appended to when set. Its directory is created if missing.
+	File string
+	// Level is one of debug, info, warn, error.
+	Level string
+}
 
 func getCustomStyles() *log.Styles {
 	styles := log.DefaultStyles()
@@ -47,48 +57,51 @@ func getCustomStyles() *log.Styles {
 	return styles
 }
 
-func Setup(logFile string, noConsole bool, logLevel string) error {
-	var writers []io.Writer
-
-	if !noConsole {
-		writers = append(writers, os.Stdout)
+// New builds a logger writing to the console and/or a file. The returned
+// function closes the log file, if any, and must be called when done.
+func New(opts Options) (*slog.Logger, func() error, error) {
+	level, err := parseLogLevel(opts.Level)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	if logFile != "" {
-		if err := os.MkdirAll(filepath.Dir(logFile), 0755); err != nil {
-			return fmt.Errorf("failed to create log directory: %w", err)
+	var writers []io.Writer
+	closeFn := func() error { return nil }
+
+	if opts.Console != nil {
+		writers = append(writers, opts.Console)
+	}
+
+	if opts.File != "" {
+		if err := os.MkdirAll(filepath.Dir(opts.File), 0755); err != nil {
+			return nil, nil, fmt.Errorf("failed to create log directory: %w", err)
 		}
 
-		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		f, err := os.OpenFile(opts.File, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 		if err != nil {
-			return fmt.Errorf("failed to open log file: %w", err)
+			return nil, nil, fmt.Errorf("failed to open log file: %w", err)
 		}
 		writers = append(writers, f)
+		closeFn = f.Close
 	}
 
 	var writer io.Writer
-	if len(writers) > 1 {
-		writer = io.MultiWriter(writers...)
-	} else if len(writers) == 1 {
-		writer = writers[0]
-	} else {
+	switch len(writers) {
+	case 0:
 		writer = io.Discard
+	case 1:
+		writer = writers[0]
+	default:
+		writer = io.MultiWriter(writers...)
 	}
 
-	level, err := parseLogLevel(logLevel)
-	if err != nil {
-		return err
-	}
-
-	logger := log.NewWithOptions(writer, log.Options{
+	handler := log.NewWithOptions(writer, log.Options{
 		Level:           level,
 		ReportTimestamp: true,
-		ReportCaller:    false,
 	})
-	logger.SetStyles(getCustomStyles())
+	handler.SetStyles(getCustomStyles())
 
-	log.SetDefault(logger)
-	return nil
+	return slog.New(handler), closeFn, nil
 }
 
 func parseLogLevel(level string) (log.Level, error) {
