@@ -19,9 +19,9 @@ import (
 var ErrHelp = pflag.ErrHelp
 
 type Config struct {
-	// Inputs holds the files, directories or patterns to process. It comes
-	// from --input, the positional arguments, or the "input" config key, in
-	// that order of preference.
+	// Inputs holds the files, directories or patterns to process: the one
+	// given with --input followed by the positional arguments or, when the
+	// command line names none, the "input" config key.
 	Inputs []string `yaml:"-"`
 
 	OutputDir    string    `yaml:"output"`
@@ -113,6 +113,12 @@ func Load(args []string) (*Config, error) {
 		return nil, withSuggestion(err, flags)
 	}
 
+	// The version is printed whatever the rest of the configuration is, so a
+	// config file that cannot be read does not get in the way.
+	if cfg.ShowVersion {
+		return cfg, nil
+	}
+
 	// cfg now holds the defaults overlaid with the command line. The config
 	// file and the environment rank in between, so they are applied on top
 	// and the command line values are then put back.
@@ -160,7 +166,7 @@ func Load(args []string) (*Config, error) {
 	_, inputFromCLI := fromCLI["input"]
 	switch {
 	case inputFromCLI:
-		cfg.Inputs = []string{file.Input}
+		cfg.Inputs = append([]string{file.Input}, flags.Args()...)
 	case flags.NArg() > 0:
 		cfg.Inputs = flags.Args()
 	case file.Input != "":

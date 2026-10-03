@@ -2,7 +2,6 @@ package cli
 
 import (
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,13 +16,15 @@ import (
 //
 // explicit is true when the argument names a single file directly rather
 // than being expanded.
-func resolveInput(input string) (files []string, explicit bool, err error) {
+//
+// A directory that cannot be read is passed to skipDir and left out, along
+// with everything below it.
+func resolveInput(input string, skipDir func(dir string, err error)) (files []string, explicit bool, err error) {
 	if info, err := os.Stat(input); err == nil {
 		if !info.IsDir() {
 			return []string{input}, true, nil
 		}
-		files, err := supportedFilesIn(input)
-		return files, false, err
+		return supportedFilesIn(input, skipDir), false, nil
 	}
 
 	if expr, ok := regexInput(input); ok {
@@ -47,18 +48,27 @@ func resolveInput(input string) (files []string, explicit bool, err error) {
 	return []string{input}, true, nil
 }
 
-func supportedFilesIn(dir string) ([]string, error) {
+// supportedFilesIn returns the supported files in dir and below, in lexical
+// order. dir may be a symlink to a directory; those found below it are not
+// followed.
+func supportedFilesIn(dir string, skipDir func(dir string, err error)) []string {
+	// What could be listed before the error is still processed.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		skipDir(dir, err)
+	}
+
 	var files []string
-	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !d.IsDir() && extractor.SupportedExtension(path) {
+	for _, entry := range entries {
+		path := filepath.Join(dir, entry.Name())
+		switch {
+		case entry.IsDir():
+			files = append(files, supportedFilesIn(path, skipDir)...)
+		case extractor.SupportedExtension(path):
 			files = append(files, path)
 		}
-		return nil
-	})
-	return files, err
+	}
+	return files
 }
 
 func matchRegex(dir string, pattern *regexp.Regexp) ([]string, error) {

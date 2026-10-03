@@ -48,10 +48,10 @@ func TestLoadUsesAllPositionalInputsWhenFlagIsMissing(t *testing.T) {
 	}
 }
 
-func TestLoadPrefersInputFlagOverPositionalArg(t *testing.T) {
-	cfg := loadConfigForTest(t, "--input", "from-flag.jpg", "from-positional.jpg")
+func TestLoadCombinesInputFlagAndPositionalArgs(t *testing.T) {
+	cfg := loadConfigForTest(t, "first.jpg", "--input", "from-flag.jpg", "second.jpg")
 
-	want := []string{"from-flag.jpg"}
+	want := []string{"from-flag.jpg", "first.jpg", "second.jpg"}
 	if !slices.Equal(cfg.Inputs, want) {
 		t.Fatalf("Inputs = %q, want %q", cfg.Inputs, want)
 	}
@@ -303,6 +303,22 @@ func TestLoadReportsHelpAndVersion(t *testing.T) {
 	cfg := loadConfigForTest(t, "--version")
 	if !cfg.ShowVersion {
 		t.Fatal("ShowVersion = false, want true")
+	}
+}
+
+// Asking for the version must work even when the configuration is unusable.
+func TestLoadReportsVersionDespiteBrokenConfig(t *testing.T) {
+	tempDir := t.TempDir()
+	writeConfig(t, tempDir, "output: [unterminated\n")
+
+	if cfg := loadConfigForTestInDir(t, tempDir, "--version"); !cfg.ShowVersion {
+		t.Fatal("ShowVersion = false, want true")
+	}
+	if cfg := loadConfigForTestInDir(t, tempDir, "--version", "--config", "missing.yaml"); !cfg.ShowVersion {
+		t.Fatal("ShowVersion = false with a missing --config, want true")
+	}
+	if _, err := config.Load([]string{"photo.jpg"}); err == nil {
+		t.Fatal("Load() without --version error = nil, want the config error")
 	}
 }
 

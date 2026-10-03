@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -95,6 +96,117 @@ func TestPrettyVerboseListsSkippedFiles(t *testing.T) {
 	}
 	if strings.Contains(got, "list them with --verbose") {
 		t.Fatalf("output suggests --verbose although it is set:\n%s", got)
+	}
+}
+
+// A batch of one file has no summary, so the skipped file is shown even
+// without --verbose.
+func TestPrettyReportsSingleSkippedFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "in"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFalsePositiveFixture(t, filepath.Join(dir, "in", "plain.jpg"))
+
+	status, got := runPretty(t, dir, "in")
+	if want := "› in  1 file\n– in/plain.jpg  skipped, not a motion photo"; status != 0 || !strings.HasPrefix(got, want) {
+		t.Fatalf("status = %d, output = %q, want it to start with %q", status, got, want)
+	}
+
+	if status, got := runPretty(t, dir, "in", "--quiet"); status != 0 || got != "" {
+		t.Fatalf("with --quiet: status = %d, output = %q, want none", status, got)
+	}
+}
+
+// Files of other types named along with photos, as a shell does for *, are
+// skipped rather than failed.
+func TestPrettyBatchSkipsUnsupportedFiles(t *testing.T) {
+	dir := t.TempDir()
+	writeMotionPhotoFixture(t, filepath.Join(dir, "a.jpg"))
+	writeFalsePositiveFixture(t, filepath.Join(dir, "plain.jpg"))
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("notes"), 0644); err != nil {
+		t.Fatalf("write notes: %v", err)
+	}
+
+	status, got := runPretty(t, dir, "a.jpg", "notes.txt", "plain.jpg", "--output", "out")
+	for _, want := range []string{
+		"\n\n✓ 1 extracted · 2 skipped · 0 failed  in ",
+		"  1 file without a video and 1 file of an unsupported type skipped, list them with --verbose\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output does not contain %q", want)
+		}
+	}
+	if status != 0 || strings.Contains(got, "notes.txt") {
+		t.Fatalf("status = %d, output:\n%s", status, got)
+	}
+	assertFileDoesNotExist(t, filepath.Join(dir, "out", "notes_photo.txt"))
+
+	status, got = runPretty(t, dir, "a.jpg", "notes.txt", "--output", "out", "--force", "--verbose")
+	if want := "– notes.txt  unsupported file extension: \".txt\"\n"; status != 0 || !strings.Contains(got, want) {
+		t.Fatalf("with --verbose: status = %d, output:\n%s\nwant it to contain %q", status, got, want)
+	}
+
+	// Its would-be outputs are not held against it either.
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("notes"), 0644); err != nil {
+		t.Fatalf("write notes: %v", err)
+	}
+	status, got = runPretty(t, dir, "a.jpg", "a.txt", "--output", "out", "--force")
+	if status != 0 || !strings.Contains(got, "1 extracted · 1 skipped · 0 failed") {
+		t.Fatalf("same base name: status = %d, output:\n%s", status, got)
+	}
+
+	// Named on its own, the file is what was asked for and cannot be extracted.
+	status, got = runPretty(t, dir, "notes.txt")
+	if !strings.HasPrefix(got, "✗ notes.txt: unsupported file extension") || status != 1 {
+		t.Fatalf("alone: status = %d, output:\n%s", status, got)
+	}
+}
+
+func TestPrettyReportsUnreadableDirectories(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs a directory that cannot be read")
+	}
+	dir := t.TempDir()
+	locked := filepath.Join(dir, "in", "locked")
+	if err := os.MkdirAll(locked, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeMotionPhotoFixture(t, filepath.Join(dir, "in", "a.jpg"))
+	writeMotionPhotoFixture(t, filepath.Join(dir, "in", "b.jpg"))
+	writeMotionPhotoFixture(t, filepath.Join(locked, "c.jpg"))
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0755) })
+
+	// The rest of the directory is still processed.
+	status, got := runPretty(t, dir, "in", "--output", "out")
+	for _, want := range []string{
+		"✗ in/locked  cannot read directory: permission denied\n",
+		"› in  2 files\n",
+		"\n\n✗ 2 extracted · 0 skipped · 0 failed  in ",
+		"  1 directory could not be read\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output does not contain %q", want)
+		}
+	}
+	if status != 1 {
+		t.Fatalf("status = %d, output:\n%s", status, got)
+	}
+	assertFileExists(t, filepath.Join(dir, "out", "b_video.mp4"))
+
+	status, got = runPretty(t, dir, "in", "--output", "out", "--force", "--log-format", "text")
+	if want := "Done extracted=2 skipped=0 failed=0 unreadable_dirs=1 "; status != 1 || !strings.Contains(got, want) {
+		t.Fatalf("text log: status = %d, output:\n%s\nwant it to contain %q", status, got, want)
+	}
+
+	// An input that cannot be read at all does not stop the others.
+	status, got = runPretty(t, dir, "in/locked", "in/a.jpg", "--output", "out", "--force")
+	want := "✗ in/locked  cannot read directory: permission denied\n✓ in/a.jpg\n"
+	if status != 1 || !strings.HasPrefix(got, want) || strings.Contains(got, "no supported files found") {
+		t.Fatalf("status = %d, output:\n%s\nwant it to start with:\n%s", status, got, want)
 	}
 }
 

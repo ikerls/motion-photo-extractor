@@ -31,13 +31,14 @@ var helpSections = []helpSection{
 			{`'/IMG_\d{4}\.jpg/'`, "A regular expression between slashes, matched against\nthe file names in the current directory"},
 		},
 		notes: []string{
-			"When more than one file is processed, files that are not motion photos are skipped.",
+			"When more than one file is processed, those that are not motion photos or",
+			"have another extension are skipped.",
 		},
 	},
 	{
 		title: "Options",
 		rows: [][2]string{
-			{"-i, --input <path>", "Input to process, instead of the arguments"},
+			{"-i, --input <path>", "Input to process, same as passing it as an argument"},
 			{"-o, --output <dir>", `Directory to save extracted files (default: ".")`},
 			{"-f, --force", "Overwrite existing output files"},
 			{"    --rename-orig", "Give extracted files the original's name and move the\noriginal to <name>_original, instead of adding suffixes"},
@@ -77,7 +78,8 @@ var helpSections = []helpSection{
 			{"-h, --help", "Show this help"},
 		},
 		notes: []string{
-			"The exit status is 1 if any file failed, and 130 if interrupted.",
+			"The exit status is 1 if any file failed or a directory could not be read,",
+			"and 130 if interrupted.",
 		},
 	},
 }
