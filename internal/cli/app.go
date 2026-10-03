@@ -123,7 +123,8 @@ func newReporter(cfg *config.Config, stderr io.Writer) (*reporter, func() error,
 }
 
 // process extracts every file designated by cfg.Inputs. It keeps going after
-// a file fails and returns errFilesFailed once all of them were tried.
+// a file fails or a directory cannot be read, and returns errFilesFailed
+// once everything was tried.
 func process(ctx context.Context, cfg *config.Config, rep *reporter) error {
 	if !cfg.ExtractPhoto && !cfg.ExtractVideo {
 		return extractor.ErrNothingToExtract
@@ -134,11 +135,14 @@ func process(ctx context.Context, cfg *config.Config, rep *reporter) error {
 	seen := make(map[string]bool)
 	for _, input := range cfg.Inputs {
 		rep.scanning(input)
-		found, isExplicit, err := resolveInput(input)
+		unreadable := rep.unreadable
+		found, isExplicit, err := resolveInput(input, rep.unreadableDir)
 		if err != nil {
 			return err
 		}
-		if !isExplicit {
+		// An input with no files needs no explaining once it was reported
+		// as unreadable.
+		if !isExplicit && (len(found) > 0 || rep.unreadable == unreadable) {
 			rep.resolved(input, len(found))
 		}
 		// A file designated by several inputs is processed once.
@@ -161,7 +165,8 @@ func process(ctx context.Context, cfg *config.Config, rep *reporter) error {
 	}
 
 	// A single file named directly must be a motion photo. In a batch, files
-	// that are not motion photos are expected and skipped.
+	// that are not motion photos are expected and skipped, and so are those
+	// of another type that a shell pattern such as * brought in.
 	strict := explicit && len(files) == 1
 
 	// Files of the same name in different directories share their outputs
@@ -179,20 +184,26 @@ func process(ctx context.Context, cfg *config.Config, rep *reporter) error {
 		}
 		rep.processing(i, file)
 
+		// A file that cannot be extracted has no outputs to collide with;
+		// extraction reports what is wrong with it.
 		targets := extractor.Targets(file, opts)
-		if err := checkOwners(owners, targets); err != nil {
+		if err := checkOwners(owners, targets); err != nil && extractor.SupportedExtension(file) {
 			rep.failedFile(file, err)
 			continue
 		}
 
 		res, err := extractor.ExtractFile(file, opts)
-		switch {
-		case err == nil:
+		// A file also owns its outputs when it failed after they were
+		// written, which is when a result comes along with the error.
+		if err == nil || res.OriginalPath != "" {
 			for _, target := range targets {
 				owners[pathKey(target)] = file
 			}
+		}
+		switch {
+		case err == nil:
 			rep.extractedFile(file, res)
-		case !strict && errors.Is(err, extractor.ErrNotMotionPhoto):
+		case !strict && (errors.Is(err, extractor.ErrNotMotionPhoto) || errors.Is(err, extractor.ErrUnsupportedExtension)):
 			rep.skippedFile(file, err)
 		default:
 			rep.failedFile(file, err)
@@ -203,7 +214,7 @@ func process(ctx context.Context, cfg *config.Config, rep *reporter) error {
 	switch {
 	case interrupted:
 		return errInterrupted
-	case rep.failed > 0:
+	case rep.failed > 0 || rep.unreadable > 0:
 		return errFilesFailed
 	default:
 		return nil

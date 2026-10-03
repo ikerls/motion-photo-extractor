@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -197,6 +199,206 @@ func TestExtractFileRenameOriginalInPlace(t *testing.T) {
 	if _, err := ExtractFile(input, Options{}); !errors.Is(err, ErrNotMotionPhoto) {
 		t.Fatalf("ExtractFile() on extracted photo error = %v, want ErrNotMotionPhoto", err)
 	}
+}
+
+// The output directory may be on another filesystem, where the original
+// cannot be renamed to. It is copied there instead.
+func TestExtractFileRenameOriginalAcrossFilesystems(t *testing.T) {
+	// Spelled out rather than taken from errCrossDevice, to check that one.
+	crossDevice := syscall.EXDEV
+	if runtime.GOOS == "windows" {
+		crossDevice = syscall.Errno(17) // ERROR_NOT_SAME_DEVICE
+	}
+
+	type fixture struct {
+		input, output string
+		info          os.FileInfo
+		original      []byte
+		opts          Options
+	}
+	setup := func(t *testing.T) fixture {
+		tempDir := t.TempDir()
+		f := fixture{
+			input:  filepath.Join(tempDir, "in", "sample.jpg"),
+			output: filepath.Join(tempDir, "out"),
+		}
+		f.opts = Options{OutputDir: f.output, RenameOriginal: true}
+		for _, dir := range []string{filepath.Dir(f.input), f.output} {
+			if err := os.Mkdir(dir, 0755); err != nil {
+				t.Fatalf("mkdir: %v", err)
+			}
+		}
+		writeMotionPhotoFixture(t, f.input)
+		modTime := time.Date(2021, 3, 4, 5, 6, 7, 0, time.UTC)
+		if err := os.Chtimes(f.input, modTime, modTime); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+		if err := os.Chmod(f.input, 0640); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		var err error
+		if f.original, err = os.ReadFile(f.input); err != nil {
+			t.Fatalf("read fixture: %v", err)
+		}
+		if f.info, err = os.Stat(f.input); err != nil {
+			t.Fatalf("stat fixture: %v", err)
+		}
+
+		renames := 0
+		renameFile = func(oldpath, newpath string) error {
+			renames++
+			return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: crossDevice}
+		}
+		t.Cleanup(func() {
+			renameFile = os.Rename
+			if renames != 1 {
+				t.Errorf("original renamed %d times, want 1 attempt", renames)
+			}
+		})
+		return f
+	}
+	moved := func(f fixture) Result {
+		return Result{
+			PhotoPath:    filepath.Join(f.output, "sample.jpg"),
+			VideoPath:    filepath.Join(f.output, "sample.mp4"),
+			OriginalPath: filepath.Join(f.output, "sample_original.jpg"),
+			Method:       MethodMetadata,
+		}
+	}
+
+	t.Run("copies the original and removes the input", func(t *testing.T) {
+		f := setup(t)
+
+		res, err := ExtractFile(f.input, f.opts)
+		if err != nil {
+			t.Fatalf("ExtractFile() error = %v", err)
+		}
+
+		want := moved(f)
+		assertResult(t, res, want)
+		assertDirEntries(t, filepath.Dir(f.input))
+		assertDirEntries(t, f.output, "sample.jpg", "sample.mp4", "sample_original.jpg")
+		assertFileContent(t, want.OriginalPath, f.original)
+
+		info, err := os.Stat(want.OriginalPath)
+		if err != nil {
+			t.Fatalf("stat original: %v", err)
+		}
+		if os.SameFile(info, f.info) {
+			t.Fatal("original is the input renamed, want a copy")
+		}
+		if !info.ModTime().Equal(f.info.ModTime()) {
+			t.Fatalf("original mod time = %v, want %v", info.ModTime(), f.info.ModTime())
+		}
+		if runtime.GOOS != "windows" && info.Mode().Perm() != 0640 {
+			t.Fatalf("original mode = %v, want %v", info.Mode().Perm(), os.FileMode(0640))
+		}
+	})
+
+	// As when the input cannot be deleted, what was written is kept. Nothing
+	// that was there before is taken away to undo the extraction.
+	t.Run("keeps the outputs when the input cannot be removed", func(t *testing.T) {
+		if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+			t.Skip("needs a directory that files cannot be removed from")
+		}
+		f := setup(t)
+		f.opts.Overwrite = true
+		earlier := filepath.Join(f.output, "sample_original.jpg")
+		if err := os.WriteFile(earlier, f.original, 0644); err != nil {
+			t.Fatalf("write earlier original: %v", err)
+		}
+		if err := os.Chmod(filepath.Dir(f.input), 0555); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		t.Cleanup(func() { os.Chmod(filepath.Dir(f.input), 0755) })
+
+		res, err := ExtractFile(f.input, f.opts)
+		if err == nil {
+			t.Fatal("ExtractFile() error = nil, want non-nil")
+		}
+		want := moved(f)
+		want.OriginalPath = f.input
+		assertResult(t, res, want)
+		assertDirEntries(t, filepath.Dir(f.input), "sample.jpg")
+		assertFileContent(t, f.input, f.original)
+		assertDirEntries(t, f.output, "sample.jpg", "sample.mp4", "sample_original.jpg")
+		assertFileContent(t, earlier, f.original)
+	})
+
+	// Undoing a failed extraction removes the copy of the original, but not
+	// an earlier original that was already there with the same content.
+	t.Run("keeps an earlier original when the photo cannot be written", func(t *testing.T) {
+		f := setup(t)
+		f.opts.Overwrite = true
+		earlier := filepath.Join(f.output, "sample_original.jpg")
+		if err := os.WriteFile(earlier, f.original, 0644); err != nil {
+			t.Fatalf("write earlier original: %v", err)
+		}
+		// A directory in the photo's place cannot be replaced by it.
+		if err := os.MkdirAll(filepath.Join(f.output, "sample.jpg", "sub"), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+
+		if _, err := ExtractFile(f.input, f.opts); err == nil {
+			t.Fatal("ExtractFile() error = nil, want non-nil")
+		}
+		assertDirEntries(t, filepath.Dir(f.input), "sample.jpg")
+		assertFileContent(t, f.input, f.original)
+		assertDirEntries(t, f.output, "sample.jpg", "sample_original.jpg")
+		assertFileContent(t, earlier, f.original)
+	})
+
+	t.Run("undoes the copy when the photo cannot be written", func(t *testing.T) {
+		f := setup(t)
+		f.opts.Overwrite = true
+		if err := os.MkdirAll(filepath.Join(f.output, "sample.jpg", "sub"), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+
+		if _, err := ExtractFile(f.input, f.opts); err == nil {
+			t.Fatal("ExtractFile() error = nil, want non-nil")
+		}
+		assertDirEntries(t, filepath.Dir(f.input), "sample.jpg")
+		assertFileContent(t, f.input, f.original)
+		assertDirEntries(t, f.output, "sample.jpg")
+	})
+
+	// A leftover staging file must not be written through: as a link to the
+	// input, that would empty the input before it is copied.
+	t.Run("does not write through a leftover staging link", func(t *testing.T) {
+		f := setup(t)
+		if err := os.Symlink(f.input, filepath.Join(f.output, "sample_original.jpg.part")); err != nil {
+			t.Skipf("cannot create symlinks: %v", err)
+		}
+
+		res, err := ExtractFile(f.input, f.opts)
+		if err != nil {
+			t.Fatalf("ExtractFile() error = %v", err)
+		}
+		assertResult(t, res, moved(f))
+		assertDirEntries(t, f.output, "sample.jpg", "sample.mp4", "sample_original.jpg")
+		assertFileContent(t, res.OriginalPath, f.original)
+	})
+
+	// An output that links to the input is replaced by the photo, which
+	// leaves the input itself in place and still to be removed.
+	t.Run("removes an input that the photo output linked to", func(t *testing.T) {
+		f := setup(t)
+		if err := os.Symlink(f.input, filepath.Join(f.output, "sample.jpg")); err != nil {
+			t.Skipf("cannot create symlinks: %v", err)
+		}
+
+		res, err := ExtractFile(f.input, f.opts)
+		if err != nil {
+			t.Fatalf("ExtractFile() error = %v", err)
+		}
+		assertResult(t, res, moved(f))
+		assertDirEntries(t, filepath.Dir(f.input))
+		assertFileContent(t, res.OriginalPath, f.original)
+		if info, err := os.Lstat(res.PhotoPath); err != nil || !info.Mode().IsRegular() {
+			t.Fatalf("photo = %v, err = %v, want a regular file", info, err)
+		}
+	})
 }
 
 func TestExtractFileRenameOriginalRefusesToClobberEarlierOriginal(t *testing.T) {

@@ -3,10 +3,14 @@ package extractor
 import (
 	"bytes"
 	"cmp"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -30,8 +34,8 @@ type Options struct {
 
 	// RenameOriginal gives the extracted files the input's base name
 	// (IMG.jpg, IMG.mp4) and moves the input to IMG_original.jpg in the
-	// output directory. Without it the outputs are IMG_photo.jpg and
-	// IMG_video.mp4.
+	// output directory, which may be on another filesystem. Without it the
+	// outputs are IMG_photo.jpg and IMG_video.mp4.
 	RenameOriginal bool
 
 	// DeleteOriginal removes the input once extraction has succeeded. Combined
@@ -77,7 +81,8 @@ func SupportedExtension(path string) bool {
 //
 // On error nothing is left behind and the input is untouched, with one
 // exception: if the outputs were written but the input could not be deleted,
-// both a Result and an error are returned.
+// or removed once copied to another filesystem, both a Result and an error
+// are returned.
 func ExtractFile(path string, opts Options) (Result, error) {
 	if opts.SkipPhoto && opts.SkipVideo {
 		return Result{}, ErrNothingToExtract
@@ -132,7 +137,8 @@ func ExtractFile(path string, opts Options) (Result, error) {
 	// An earlier original is not an output and cannot be extracted again, so
 	// Overwrite only replaces it with itself.
 	moveOriginal := opts.RenameOriginal && !deleteOriginal
-	if moveOriginal && exists(out.original) {
+	originalExisted := moveOriginal && exists(out.original)
+	if originalExisted {
 		if !opts.Overwrite {
 			return Result{}, fmt.Errorf("renamed original already exists: %s", out.original)
 		}
@@ -177,21 +183,43 @@ func ExtractFile(path string, opts Options) (Result, error) {
 		created = append(created, stagedPhoto)
 	}
 
+	// An original that cannot be renamed, the output directory being on
+	// another filesystem, is copied there. The input is then removed last:
+	// until that point, undoing the extraction never involves putting it back.
+	copiedOriginal := false
 	if moveOriginal {
-		if err := os.Rename(path, out.original); err != nil {
+		err := renameFile(path, out.original)
+		if errors.Is(err, errCrossDevice) {
+			copiedOriginal = true
+			err = copyFile(path, out.original, info)
+		}
+		if err != nil {
 			return fail(fmt.Errorf("rename original: %w", err))
+		}
+		// An earlier original had the same content, so it is not undone.
+		if copiedOriginal && !originalExisted {
+			created = append(created, out.original)
 		}
 		res.OriginalPath = out.original
 	}
 
 	if writePhoto {
 		if err := os.Rename(stagedPhoto, out.photo); err != nil {
-			if moveOriginal {
+			if moveOriginal && !copiedOriginal {
 				os.Rename(out.original, path)
 			}
 			return fail(fmt.Errorf("write photo: %w", err))
 		}
 		res.PhotoPath = out.photo
+	}
+
+	// Unless the photo took its place, the input is still there. Should it
+	// not go away, the outputs are kept, as when it cannot be deleted.
+	if copiedOriginal && isSameFile(path, info) {
+		if err := os.Remove(path); err != nil {
+			res.OriginalPath = path
+			return res, fmt.Errorf("remove original, copied to %s: %w", out.original, err)
+		}
 	}
 
 	if deleteOriginal {
@@ -263,6 +291,54 @@ func stageFile(path string, data []byte, modTime time.Time) (string, error) {
 		return "", err
 	}
 	return staged, nil
+}
+
+// renameFile moves the original. Tests replace it to stand in for an output
+// directory on another filesystem.
+var renameFile = os.Rename
+
+// errCrossDevice is what os.Rename fails with when its two paths are on
+// different filesystems.
+var errCrossDevice = func() error {
+	if runtime.GOOS == "windows" {
+		return syscall.Errno(0x11) // ERROR_NOT_SAME_DEVICE
+	}
+	return syscall.EXDEV
+}()
+
+// copyFile copies src, which info describes, to dst along with its
+// permissions and modification time. On error dst is left as it was.
+func copyFile(src, dst string, info os.FileInfo) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	// A leftover is removed, never written through: it may link to src.
+	staged := dst + ".part"
+	os.Remove(staged)
+	out, err := os.OpenFile(staged, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(out, in)
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Chmod(staged, info.Mode().Perm())
+	}
+	if err == nil {
+		err = os.Chtimes(staged, info.ModTime(), info.ModTime())
+	}
+	if err == nil {
+		err = os.Rename(staged, dst)
+	}
+	if err != nil {
+		os.Remove(staged)
+	}
+	return err
 }
 
 func exists(path string) bool {

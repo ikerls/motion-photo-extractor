@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -195,6 +196,47 @@ func TestProcessKeepsFilesWhoseOutputsCollide(t *testing.T) {
 	}
 }
 
+// A file that failed after its outputs were written, its original not being
+// removable, has them all the same. A later file must not replace them.
+func TestProcessKeepsOutputsOfAFileThatFailedAfterWritingThem(t *testing.T) {
+	if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+		t.Skip("needs a directory that files cannot be removed from")
+	}
+	tempDir := t.TempDir()
+	output := filepath.Join(tempDir, "out")
+	first := filepath.Join(tempDir, "in", "a", "IMG.jpg")
+	second := filepath.Join(tempDir, "in", "b", "IMG.jpg")
+	for _, input := range []string{first, second} {
+		if err := os.MkdirAll(filepath.Dir(input), 0755); err != nil {
+			t.Fatalf("mkdir input dir: %v", err)
+		}
+		writeMotionPhotoFixture(t, input)
+	}
+	// Told apart from the first file's outputs by its size.
+	appendToFile(t, second, []byte("more video"))
+	if err := os.Chmod(filepath.Dir(first), 0555); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(filepath.Dir(first), 0755) })
+
+	cfg := testConfig(output, filepath.Join(tempDir, "in"))
+	cfg.DeleteOrig, cfg.Force = true, true
+	rep := discardReporter()
+	if err := process(t.Context(), cfg, rep); err != errFilesFailed {
+		t.Fatalf("process() error = %v, want errFilesFailed", err)
+	}
+	if rep.extracted != 0 || rep.failed != 2 {
+		t.Fatalf("extracted = %d, failed = %d, want 0 and 2", rep.extracted, rep.failed)
+	}
+
+	assertFileExists(t, first)
+	assertFileContent(t, second, append(buildMotionPhotoFixture(), "more video"...))
+	assertFileExists(t, filepath.Join(output, "IMG_photo.jpg"))
+	if got, want := fileSize(filepath.Join(output, "IMG_video.mp4")), int64(24); got != want {
+		t.Fatalf("video size = %d, want the first file's %d", got, want)
+	}
+}
+
 func TestProcessExtractsAFileNamedTwiceOnce(t *testing.T) {
 	tempDir := t.TempDir()
 	output := filepath.Join(tempDir, "out")
@@ -315,6 +357,43 @@ func TestRunPrintsHelpAndVersionToStdout(t *testing.T) {
 	Run([]string{"--version"}, &stdout, &stderr, "1.2.3")
 	if got := stdout.String(); got != "go-motion-photo 1.2.3\n" {
 		t.Fatalf("--version: stdout = %q", got)
+	}
+}
+
+// A config file that cannot be read must not keep the version from showing.
+func TestRunPrintsVersionDespiteBrokenConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	t.Setenv("HOME", dir)
+	if err := os.WriteFile(filepath.Join(dir, "go-motion-photo.yaml"), []byte("output: [unterminated"), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	status := Run([]string{"--version"}, &stdout, &stderr, "1.2.3")
+	if status != 0 || stdout.String() != "go-motion-photo 1.2.3\n" || stderr.Len() != 0 {
+		t.Fatalf("status = %d, stdout = %q, stderr = %q", status, &stdout, &stderr)
+	}
+
+	if status := Run([]string{"a.jpg"}, &stdout, &stderr, "1.2.3"); status != 1 || !strings.Contains(stderr.String(), "failed to read config file") {
+		t.Fatalf("without --version: status = %d, stderr = %q", status, &stderr)
+	}
+}
+
+func TestRunProcessesInputFlagAndArguments(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	t.Setenv("HOME", dir)
+	for _, name := range []string{"a.jpg", "b.jpg", "c.jpg"} {
+		writeMotionPhotoFixture(t, filepath.Join(dir, name))
+	}
+
+	var stdout, stderr bytes.Buffer
+	if status := Run([]string{"a.jpg", "--input", "b.jpg", "c.jpg", "--output", "out"}, &stdout, &stderr, "test"); status != 0 {
+		t.Fatalf("status = %d, stderr = %q", status, &stderr)
+	}
+	for _, name := range []string{"a_video.mp4", "b_video.mp4", "c_video.mp4"} {
+		assertFileExists(t, filepath.Join(dir, "out", name))
 	}
 }
 

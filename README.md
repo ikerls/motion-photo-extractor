@@ -14,7 +14,7 @@ A command-line tool and Go library for handling **Samsung Motion Photos**. Extra
 ## Options
 
 ### Input Options
-- `<path>...` / `-i`, `--input <path>`: Motion photo files, directories or patterns
+- `<path>...` / `-i`, `--input <path>`: Motion photo files, directories or patterns. `--input` adds one more to those given as arguments
     - Single file: `photo.jpg`
     - Several files: `a.jpg b.jpg c.heic`
     - Directory: `./photos` (searched recursively)
@@ -22,7 +22,9 @@ A command-line tool and Go library for handling **Samsung Motion Photos**. Extra
     - Glob pattern: `'*.jpg'`
     - Supported formats: `.jpg`, `.jpeg`, `.heic`
 
-When more than one file is processed, files that are not motion photos are skipped. A single file named directly must be a motion photo.
+When more than one file is processed, files that are not motion photos or have another extension are skipped. A single file named directly must be a motion photo.
+
+A directory that cannot be read is reported and left out; the rest of the run goes on.
 
 ### Output Options
 - `-o`, `--output <dir>`: Output directory for extracted files (default: current directory)
@@ -33,6 +35,8 @@ When more than one file is processed, files that are not motion photos are skipp
 - `-f`, `--force`: Overwrite existing output files
 
 Existing output files are kept and reported unless `--force` is given. When one is kept, `--delete-orig` leaves the original in place.
+
+With `--rename-orig`, an original on another filesystem than the output directory is copied there and then removed. If it cannot be removed, the extracted files and the copy are kept and the file is reported as failed.
 
 Files with the same name in different directories would share their outputs in one output directory. Only the first is extracted; the others are reported as failed and left untouched.
 
@@ -68,7 +72,7 @@ $ go-motion-photo ./photos -o ./extracted
 
 ### Exit status
 - `0`: every file was extracted or skipped
-- `1`: invalid usage, or at least one file failed
+- `1`: invalid usage, at least one file failed, or a directory could not be read
 - `130`: interrupted with Ctrl+C; the file being processed is finished first
 
 ## Configuration

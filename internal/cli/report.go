@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -32,10 +33,12 @@ type reporter struct {
 	total     int
 	nameWidth int
 
-	extracted int
-	unchanged int // every output already existed
-	notMotion int
-	failed    int
+	extracted   int
+	unchanged   int // every output already existed
+	notMotion   int
+	unsupported int // files in a batch whose extension is not supported
+	failed      int
+	unreadable  int // directories whose files were left out
 
 	photos, videos int
 	written        int64 // bytes
@@ -61,6 +64,13 @@ func (r *reporter) ignoredConfig(path string) {
 
 func (r *reporter) scanning(input string) {
 	r.out.showStatus("Scanning " + input + " …")
+}
+
+// unreadableDir reports a directory that could not be searched for files.
+func (r *reporter) unreadableDir(dir string, err error) {
+	r.unreadable++
+	r.log.Error("Cannot read directory", "dir", dir, "err", err)
+	r.out.event(slog.LevelError, r.out.fail.Render(symbolFail), dir, "cannot read directory: "+describe(err, dir))
 }
 
 // resolved reports how many files a directory or pattern expanded to.
@@ -215,11 +225,25 @@ func (r *reporter) tree(heading string, details []detail) []string {
 	return lines
 }
 
-// skippedFile reports a file left alone because it is not a motion photo.
+// skippedFile reports a file of a batch left alone because it is not a
+// motion photo or not of a supported type.
 func (r *reporter) skippedFile(file string, reason error) {
-	r.notMotion++
-	r.log.Debug("Skipped, not a motion photo", "file", file, "reason", reason)
-	r.out.event(slog.LevelDebug, r.out.dim.Render(symbolSkip), r.out.dim.Render(r.name(file)), r.out.dim.Render(reason.Error()))
+	message := "Skipped, not a motion photo"
+	if errors.Is(reason, extractor.ErrUnsupportedExtension) {
+		r.unsupported++
+		message = "Skipped, unsupported file extension"
+	} else {
+		r.notMotion++
+	}
+
+	// Skipped files are summed up at the end of a run, except for a single
+	// file: this is then all that is said about it.
+	level, details := slog.LevelDebug, reason.Error()
+	if r.single() {
+		level, details = slog.LevelInfo, "skipped, "+details
+	}
+	r.log.Log(context.Background(), level, message, "file", file, "reason", reason)
+	r.out.event(level, r.out.dim.Render(symbolSkip), r.out.dim.Render(r.name(file)), r.out.dim.Render(details))
 }
 
 func (r *reporter) failedFile(file string, err error) {
@@ -247,8 +271,9 @@ func (r *reporter) finish(outputDir string, elapsed time.Duration, interrupted b
 		return
 	}
 
-	processed := r.extracted + r.unchanged + r.notMotion + r.failed
-	skipped := r.unchanged + r.notMotion
+	notExtractable := r.notMotion + r.unsupported
+	processed := r.extracted + r.unchanged + notExtractable + r.failed
+	skipped := r.unchanged + notExtractable
 	if interrupted {
 		r.log.Warn("Interrupted", "processed", processed, "files", r.total)
 		r.out.event(slog.LevelWarn, r.out.warn.Render(symbolWarn), "Interrupted", fmt.Sprintf("%d of %d files processed", processed, r.total))
@@ -256,12 +281,15 @@ func (r *reporter) finish(outputDir string, elapsed time.Duration, interrupted b
 
 	var lines []string
 	if !r.single() {
-		r.log.Info("Done", "extracted", r.extracted, "skipped", skipped, "failed", r.failed,
-			"bytes", r.written, "elapsed", elapsed.Round(time.Millisecond).String())
+		attrs := []any{"extracted", r.extracted, "skipped", skipped, "failed", r.failed}
+		if r.unreadable > 0 {
+			attrs = append(attrs, "unreadable_dirs", r.unreadable)
+		}
+		r.log.Info("Done", append(attrs, "bytes", r.written, "elapsed", elapsed.Round(time.Millisecond).String())...)
 
 		symbol := r.out.dim.Render(symbolSkip)
 		switch {
-		case r.failed > 0:
+		case r.failed > 0 || r.unreadable > 0:
 			symbol = r.out.fail.Render(symbolFail)
 		case r.extracted > 0:
 			symbol = r.out.ok.Render(symbolOK)
@@ -294,8 +322,22 @@ func (r *reporter) finish(outputDir string, elapsed time.Duration, interrupted b
 			lines = append(lines, fmt.Sprintf("  %s, %s, written %s",
 				strings.Join(outputs, " and "), formatSize(r.written), destination))
 		}
-		if r.notMotion > 0 && !r.out.enabled(slog.LevelDebug) {
-			lines = append(lines, "  "+r.out.dim.Render(plural(r.notMotion, "file")+" without a video skipped, list them with --verbose"))
+		var reasons []string
+		if r.notMotion > 0 {
+			reasons = append(reasons, plural(r.notMotion, "file")+" without a video")
+		}
+		if r.unsupported > 0 {
+			reasons = append(reasons, plural(r.unsupported, "file")+" of an unsupported type")
+		}
+		if len(reasons) > 0 && !r.out.enabled(slog.LevelDebug) {
+			lines = append(lines, "  "+r.out.dim.Render(strings.Join(reasons, " and ")+" skipped, list them with --verbose"))
+		}
+		if r.unreadable > 0 {
+			dirs := "1 directory"
+			if r.unreadable > 1 {
+				dirs = fmt.Sprintf("%d directories", r.unreadable)
+			}
+			lines = append(lines, "  "+dirs+" could not be read")
 		}
 	}
 	if len(lines) > 0 {
