@@ -202,8 +202,8 @@ func TestLoadReadsJSONConfig(t *testing.T) {
 				t.Fatalf("OutputDir = %q, Force = %v, Log.Level = %q, want /photos/out, true and warn", cfg.OutputDir, cfg.Force, cfg.Log.Level)
 			}
 			// Keys left out keep their defaults.
-			if !cfg.ExtractPhoto || !cfg.ExtractVideo {
-				t.Fatalf("ExtractPhoto = %v, ExtractVideo = %v, want both true", cfg.ExtractPhoto, cfg.ExtractVideo)
+			if !cfg.ExtractVideo || cfg.Log.Format != "auto" {
+				t.Fatalf("ExtractVideo = %v, Log.Format = %q, want true and auto", cfg.ExtractVideo, cfg.Log.Format)
 			}
 		})
 	}
@@ -354,6 +354,52 @@ func TestLoadReadsConfigFromHomeConfigDirectory(t *testing.T) {
 	}
 	if cfg.OutputDir != "from-home" {
 		t.Fatalf("OutputDir = %q, want %q", cfg.OutputDir, "from-home")
+	}
+}
+
+func TestLoadParsesShortFlags(t *testing.T) {
+	cfg := loadConfigForTest(t, "-i", "photo.jpg", "-o", "out", "-f")
+
+	if !slices.Equal(cfg.Inputs, []string{"photo.jpg"}) {
+		t.Fatalf("Inputs = %q, want %q", cfg.Inputs, []string{"photo.jpg"})
+	}
+	if cfg.OutputDir != "out" {
+		t.Fatalf("OutputDir = %q, want %q", cfg.OutputDir, "out")
+	}
+	if !cfg.Force {
+		t.Fatal("Force = false, want true")
+	}
+}
+
+func TestLoadVerboseAndQuietSetLogLevel(t *testing.T) {
+	tests := []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"-v", "photo.jpg"}, want: "debug"},
+		{args: []string{"--quiet", "photo.jpg"}, want: "warn"},
+		{args: []string{"--log-level", "error", "--verbose", "photo.jpg"}, want: "debug"},
+	}
+
+	for _, tc := range tests {
+		cfg := loadConfigForTest(t, tc.args...)
+		if cfg.Log.Level != tc.want {
+			t.Fatalf("Load(%q): Log.Level = %q, want %q", tc.args, cfg.Log.Level, tc.want)
+		}
+	}
+}
+
+func TestLoadReadsLogFormat(t *testing.T) {
+	if cfg := loadConfigForTest(t, "photo.jpg"); cfg.Log.Format != "auto" {
+		t.Fatalf("Log.Format = %q, want %q", cfg.Log.Format, "auto")
+	}
+
+	t.Setenv("GO_MOTION_PHOTO_LOG_FORMAT", "json")
+	if cfg := loadConfigForTest(t, "photo.jpg"); cfg.Log.Format != "json" {
+		t.Fatalf("Log.Format = %q, want %q", cfg.Log.Format, "json")
+	}
+	if cfg := loadConfigForTest(t, "--log-format", "text", "photo.jpg"); cfg.Log.Format != "text" {
+		t.Fatalf("Log.Format = %q, want %q", cfg.Log.Format, "text")
 	}
 }
 

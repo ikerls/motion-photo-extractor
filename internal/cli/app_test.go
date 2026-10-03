@@ -19,7 +19,7 @@ func TestProcessSingleFile(t *testing.T) {
 	output := filepath.Join(tempDir, "out")
 	writeMotionPhotoFixture(t, input)
 
-	if err := process(testConfig(output, input), discardLogger()); err != nil {
+	if err := process(t.Context(), testConfig(output, input), discardReporter()); err != nil {
 		t.Fatalf("process() error = %v", err)
 	}
 
@@ -36,7 +36,7 @@ func TestProcessSingleFileWithoutVideoExtraction(t *testing.T) {
 	cfg := testConfig(output, input)
 	cfg.ExtractVideo = false
 
-	if err := process(cfg, discardLogger()); err != nil {
+	if err := process(t.Context(), cfg, discardReporter()); err != nil {
 		t.Fatalf("process() error = %v", err)
 	}
 
@@ -50,7 +50,7 @@ func TestProcessSingleFileRejectsFalsePositive(t *testing.T) {
 	output := filepath.Join(tempDir, "out")
 	writeFalsePositiveFixture(t, input)
 
-	err := process(testConfig(output, input), discardLogger())
+	err := process(t.Context(), testConfig(output, input), discardReporter())
 	if err == nil {
 		t.Fatal("process() error = nil, want non-nil")
 	}
@@ -67,7 +67,7 @@ func TestProcessSeveralInputs(t *testing.T) {
 	writeMotionPhotoFixture(t, first)
 	writeMotionPhotoFixture(t, second)
 
-	if err := process(testConfig(output, first, second), discardLogger()); err != nil {
+	if err := process(t.Context(), testConfig(output, first, second), discardReporter()); err != nil {
 		t.Fatalf("process() error = %v", err)
 	}
 
@@ -89,7 +89,7 @@ func TestProcessDirectoryProcessesSupportedFiles(t *testing.T) {
 		t.Fatalf("write skip file: %v", err)
 	}
 
-	if err := process(testConfig(output, inputDir), discardLogger()); err != nil {
+	if err := process(t.Context(), testConfig(output, inputDir), discardReporter()); err != nil {
 		t.Fatalf("process() error = %v", err)
 	}
 
@@ -111,7 +111,7 @@ func TestProcessDirectorySkipsFilesThatAreNotMotionPhotos(t *testing.T) {
 	writeMotionPhotoFixture(t, filepath.Join(inputDir, "motion.jpg"))
 	writeFalsePositiveFixture(t, filepath.Join(inputDir, "plain.jpg"))
 
-	if err := process(testConfig(output, inputDir), discardLogger()); err != nil {
+	if err := process(t.Context(), testConfig(output, inputDir), discardReporter()); err != nil {
 		t.Fatalf("process() error = %v", err)
 	}
 
@@ -125,12 +125,95 @@ func TestProcessBatchReportsFailures(t *testing.T) {
 	good := filepath.Join(tempDir, "good.jpg")
 	writeMotionPhotoFixture(t, good)
 
-	err := process(testConfig(output, good, filepath.Join(tempDir, "missing.jpg")), discardLogger())
+	err := process(t.Context(), testConfig(output, good, filepath.Join(tempDir, "missing.jpg")), discardReporter())
 	if err == nil {
 		t.Fatal("process() error = nil, want non-nil")
 	}
 
 	assertFileExists(t, filepath.Join(output, "good_video.mp4"))
+}
+
+// Files of the same name in different directories would share their outputs
+// in one output directory. Only the first may have them.
+func TestProcessKeepsFilesWhoseOutputsCollide(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*config.Config)
+		outputs   []string
+	}{
+		{
+			name:      "delete original",
+			configure: func(cfg *config.Config) { cfg.DeleteOrig = true },
+			outputs:   []string{"IMG_photo.jpg", "IMG_video.mp4"},
+		},
+		{
+			name:      "delete original and overwrite",
+			configure: func(cfg *config.Config) { cfg.DeleteOrig, cfg.Force = true, true },
+			outputs:   []string{"IMG_photo.jpg", "IMG_video.mp4"},
+		},
+		{
+			name:      "rename original and overwrite",
+			configure: func(cfg *config.Config) { cfg.RenameOrig, cfg.Force = true, true },
+			outputs:   []string{"IMG.jpg", "IMG.mp4", "IMG_original.jpg"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			output := filepath.Join(tempDir, "out")
+			first := filepath.Join(tempDir, "in", "a", "IMG.jpg")
+			second := filepath.Join(tempDir, "in", "b", "IMG.jpg")
+			for _, input := range []string{first, second} {
+				if err := os.MkdirAll(filepath.Dir(input), 0755); err != nil {
+					t.Fatalf("mkdir input dir: %v", err)
+				}
+				writeMotionPhotoFixture(t, input)
+			}
+			// Told apart from the first file's outputs by its size.
+			appendToFile(t, second, []byte("more video"))
+
+			cfg := testConfig(output, filepath.Join(tempDir, "in"))
+			tc.configure(cfg)
+			rep := discardReporter()
+			if err := process(t.Context(), cfg, rep); err != errFilesFailed {
+				t.Fatalf("process() error = %v, want errFilesFailed", err)
+			}
+			if rep.extracted != 1 || rep.failed != 1 {
+				t.Fatalf("extracted = %d, failed = %d, want 1 and 1", rep.extracted, rep.failed)
+			}
+
+			assertFileDoesNotExist(t, first)
+			assertFileContent(t, second, append(buildMotionPhotoFixture(), "more video"...))
+			for _, name := range tc.outputs {
+				assertFileExists(t, filepath.Join(output, name))
+			}
+			if got, want := fileSize(filepath.Join(output, tc.outputs[1])), int64(24); got != want {
+				t.Fatalf("video size = %d, want the first file's %d", got, want)
+			}
+		})
+	}
+}
+
+func TestProcessExtractsAFileNamedTwiceOnce(t *testing.T) {
+	tempDir := t.TempDir()
+	output := filepath.Join(tempDir, "out")
+	input := filepath.Join(tempDir, "in", "single.jpg")
+	if err := os.MkdirAll(filepath.Dir(input), 0755); err != nil {
+		t.Fatalf("mkdir input dir: %v", err)
+	}
+	writeMotionPhotoFixture(t, input)
+
+	cfg := testConfig(output, filepath.Join(tempDir, "in"), input)
+	cfg.DeleteOrig = true
+	rep := discardReporter()
+	if err := process(t.Context(), cfg, rep); err != nil {
+		t.Fatalf("process() error = %v", err)
+	}
+	if rep.total != 1 || rep.extracted != 1 {
+		t.Fatalf("total = %d, extracted = %d, want 1 and 1", rep.total, rep.extracted)
+	}
+	assertFileExists(t, filepath.Join(output, "single_video.mp4"))
 }
 
 func TestProcessGlobPattern(t *testing.T) {
@@ -142,7 +225,7 @@ func TestProcessGlobPattern(t *testing.T) {
 		t.Fatalf("write png fixture: %v", err)
 	}
 
-	if err := process(testConfig(output, filepath.Join(tempDir, "g*")), discardLogger()); err != nil {
+	if err := process(t.Context(), testConfig(output, filepath.Join(tempDir, "g*")), discardReporter()); err != nil {
 		t.Fatalf("process() error = %v", err)
 	}
 
@@ -161,7 +244,7 @@ func TestProcessRegexPattern(t *testing.T) {
 	writeMotionPhotoFixture(t, filepath.Join(tempDir, "OTHER_0003.jpg"))
 
 	t.Chdir(tempDir)
-	if err := process(testConfig(output, `/IMG_\d{4}\.jpg/`), discardLogger()); err != nil {
+	if err := process(t.Context(), testConfig(output, `/IMG_\d{4}\.jpg/`), discardReporter()); err != nil {
 		t.Fatalf("process() error = %v", err)
 	}
 
@@ -173,14 +256,14 @@ func TestProcessRegexPattern(t *testing.T) {
 }
 
 func TestProcessInvalidRegexReturnsError(t *testing.T) {
-	err := process(testConfig(t.TempDir(), `/[unterminated/`), discardLogger())
+	err := process(t.Context(), testConfig(t.TempDir(), `/[unterminated/`), discardReporter())
 	if err == nil {
 		t.Fatal("process() error = nil, want non-nil")
 	}
 }
 
 func TestProcessInvalidGlobReturnsError(t *testing.T) {
-	err := process(testConfig(t.TempDir(), "["), discardLogger())
+	err := process(t.Context(), testConfig(t.TempDir(), "["), discardReporter())
 	if err == nil {
 		t.Fatal("process() error = nil, want non-nil")
 	}
@@ -244,8 +327,8 @@ func testConfig(output string, inputs ...string) *config.Config {
 	}
 }
 
-func discardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+func discardReporter() *reporter {
+	return &reporter{log: slog.New(slog.DiscardHandler), out: newConsole(io.Discard, slog.LevelInfo)}
 }
 
 func writeMotionPhotoFixture(t *testing.T, path string) {
@@ -305,6 +388,31 @@ func buildFalsePositiveFixture() []byte {
 	data = append(data, bytes.Repeat([]byte{0x00}, 32)...)
 	data = append(data, []byte("mpvdnot-an-mp4-payload")...)
 	return data
+}
+
+func appendToFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	if _, err := file.Write(data); err != nil {
+		t.Fatalf("append to %s: %v", path, err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close %s: %v", path, err)
+	}
+}
+
+func assertFileContent(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("content of %s = %q, want %q", path, got, want)
+	}
 }
 
 func assertFileExists(t *testing.T, path string) {

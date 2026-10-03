@@ -216,6 +216,142 @@ func TestExtractFileRenameOriginalRefusesToClobberEarlierOriginal(t *testing.T) 
 	assertFileContent(t, earlier, []byte("earlier"))
 }
 
+// Overwrite replaces outputs, which can be extracted again. An earlier
+// original cannot, so it is only replaced by the same content.
+func TestExtractFileOverwriteKeepsADifferentEarlierOriginal(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "sample.jpg")
+	writeMotionPhotoFixture(t, input)
+	original, err := os.ReadFile(input)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	earlier := filepath.Join(tempDir, "sample_original.jpg")
+	if err := os.WriteFile(earlier, []byte("earlier"), 0644); err != nil {
+		t.Fatalf("write earlier original: %v", err)
+	}
+
+	opts := Options{RenameOriginal: true, Overwrite: true}
+	if _, err := ExtractFile(input, opts); err == nil {
+		t.Fatal("ExtractFile() error = nil, want non-nil")
+	}
+	assertDirEntries(t, tempDir, "sample.jpg", "sample_original.jpg")
+	assertFileContent(t, input, original)
+	assertFileContent(t, earlier, []byte("earlier"))
+
+	if err := os.WriteFile(earlier, original, 0644); err != nil {
+		t.Fatalf("write identical original: %v", err)
+	}
+	if _, err := ExtractFile(input, opts); err != nil {
+		t.Fatalf("ExtractFile() with identical earlier original error = %v", err)
+	}
+	assertDirEntries(t, tempDir, "sample.jpg", "sample.mp4", "sample_original.jpg")
+	assertFileContent(t, earlier, original)
+}
+
+// An output that already exists may come from another file, so the input is
+// not deleted for it.
+func TestExtractFileDeleteOriginalKeepsInputWhenOutputSkipped(t *testing.T) {
+	t.Run("separate outputs", func(t *testing.T) {
+		tempDir := t.TempDir()
+		input := filepath.Join(tempDir, "sample.jpg")
+		writeMotionPhotoFixture(t, input)
+		videoPath := filepath.Join(tempDir, "sample_video.mp4")
+		if err := os.WriteFile(videoPath, []byte("existing"), 0644); err != nil {
+			t.Fatalf("write existing video: %v", err)
+		}
+
+		res, err := ExtractFile(input, Options{DeleteOriginal: true})
+		if err != nil {
+			t.Fatalf("ExtractFile() error = %v", err)
+		}
+		assertResult(t, res, Result{
+			PhotoPath:    filepath.Join(tempDir, "sample_photo.jpg"),
+			OriginalPath: input,
+			Skipped:      []string{videoPath},
+			Method:       MethodMetadata,
+		})
+		assertDirEntries(t, tempDir, "sample.jpg", "sample_photo.jpg", "sample_video.mp4")
+		assertFileContent(t, videoPath, []byte("existing"))
+
+		res, err = ExtractFile(input, Options{DeleteOriginal: true, Overwrite: true})
+		if err != nil {
+			t.Fatalf("ExtractFile() with Overwrite error = %v", err)
+		}
+		if res.OriginalPath != "" {
+			t.Fatalf("OriginalPath with Overwrite = %q, want empty", res.OriginalPath)
+		}
+		assertDirEntries(t, tempDir, "sample_photo.jpg", "sample_video.mp4")
+	})
+
+	// The photo would take the input's place, which deletes it just as well.
+	// The input is moved aside instead, as without DeleteOriginal.
+	t.Run("photo replaces input", func(t *testing.T) {
+		tempDir := t.TempDir()
+		input := filepath.Join(tempDir, "sample.jpg")
+		writeMotionPhotoFixture(t, input)
+		original, err := os.ReadFile(input)
+		if err != nil {
+			t.Fatalf("read fixture: %v", err)
+		}
+		videoPath := filepath.Join(tempDir, "sample.mp4")
+		if err := os.WriteFile(videoPath, []byte("existing"), 0644); err != nil {
+			t.Fatalf("write existing video: %v", err)
+		}
+
+		res, err := ExtractFile(input, Options{DeleteOriginal: true, RenameOriginal: true})
+		if err != nil {
+			t.Fatalf("ExtractFile() error = %v", err)
+		}
+		want := Result{
+			PhotoPath:    input,
+			OriginalPath: filepath.Join(tempDir, "sample_original.jpg"),
+			Skipped:      []string{videoPath},
+			Method:       MethodMetadata,
+		}
+		assertResult(t, res, want)
+		assertFileContent(t, want.OriginalPath, original)
+		assertFileContent(t, videoPath, []byte("existing"))
+	})
+}
+
+func TestTargets(t *testing.T) {
+	input := filepath.Join("photos", "sample.jpg")
+
+	tests := []struct {
+		name string
+		opts Options
+		want []string
+	}{
+		{
+			name: "next to the input",
+			want: []string{filepath.Join("photos", "sample_photo.jpg"), filepath.Join("photos", "sample_video.mp4")},
+		},
+		{
+			name: "output directory without photo",
+			opts: Options{OutputDir: "out", SkipPhoto: true},
+			want: []string{filepath.Join("out", "sample_video.mp4")},
+		},
+		{
+			name: "rename original",
+			opts: Options{OutputDir: "out", RenameOriginal: true},
+			want: []string{
+				filepath.Join("out", "sample.jpg"),
+				filepath.Join("out", "sample.mp4"),
+				filepath.Join("out", "sample_original.jpg"),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Targets(input, tc.opts); !slices.Equal(got, tc.want) {
+				t.Fatalf("Targets() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestExtractFileDeleteOriginal(t *testing.T) {
 	t.Run("separate outputs", func(t *testing.T) {
 		tempDir := t.TempDir()
