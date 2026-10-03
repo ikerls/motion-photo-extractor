@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"time"
 
 	"github.com/ikerls/motion-photo-extractor/internal/config"
@@ -115,7 +116,7 @@ func newReporter(cfg *config.Config, stderr io.Writer) (*reporter, func() error,
 	if err != nil {
 		return nil, nil, err
 	}
-	return &reporter{log: log, out: out}, closeLog, nil
+	return &reporter{log: log, out: out, deleteOrig: cfg.DeleteOrig}, closeLog, nil
 }
 
 // process extracts every file designated by cfg.Inputs. It keeps going after
@@ -127,6 +128,7 @@ func process(ctx context.Context, cfg *config.Config, rep *reporter) error {
 
 	var files []string
 	explicit := true
+	seen := make(map[string]bool)
 	for _, input := range cfg.Inputs {
 		rep.scanning(input)
 		found, isExplicit, err := resolveInput(input)
@@ -136,7 +138,13 @@ func process(ctx context.Context, cfg *config.Config, rep *reporter) error {
 		if !isExplicit {
 			rep.resolved(input, len(found))
 		}
-		files = append(files, found...)
+		// A file designated by several inputs is processed once.
+		for _, file := range found {
+			if key := pathKey(file); !seen[key] {
+				seen[key] = true
+				files = append(files, file)
+			}
+		}
 		explicit = explicit && isExplicit
 	}
 
@@ -153,6 +161,11 @@ func process(ctx context.Context, cfg *config.Config, rep *reporter) error {
 	// that are not motion photos are expected and skipped.
 	strict := explicit && len(files) == 1
 
+	// Files of the same name in different directories share their outputs
+	// when these go to one directory. The first one extracted owns them; the
+	// others would overwrite its outputs or pass them off as their own.
+	owners := make(map[string]string)
+
 	rep.begin(files)
 	start := time.Now()
 	interrupted := false
@@ -163,9 +176,18 @@ func process(ctx context.Context, cfg *config.Config, rep *reporter) error {
 		}
 		rep.processing(i, file)
 
+		targets := extractor.Targets(file, opts)
+		if err := checkOwners(owners, targets); err != nil {
+			rep.failedFile(file, err)
+			continue
+		}
+
 		res, err := extractor.ExtractFile(file, opts)
 		switch {
 		case err == nil:
+			for _, target := range targets {
+				owners[pathKey(target)] = file
+			}
 			rep.extractedFile(file, res)
 		case !strict && errors.Is(err, extractor.ErrNotMotionPhoto):
 			rep.skippedFile(file, err)
@@ -183,4 +205,23 @@ func process(ctx context.Context, cfg *config.Config, rep *reporter) error {
 	default:
 		return nil
 	}
+}
+
+// checkOwners returns an error if one of targets is an output of a file
+// extracted earlier in the run.
+func checkOwners(owners map[string]string, targets []string) error {
+	for _, target := range targets {
+		if owner, ok := owners[pathKey(target)]; ok {
+			return fmt.Errorf("%s is already the output of %s, extract this file to another directory", target, owner)
+		}
+	}
+	return nil
+}
+
+// pathKey identifies the file at path however the path is spelled.
+func pathKey(path string) string {
+	if abs, err := filepath.Abs(path); err == nil {
+		return abs
+	}
+	return filepath.Clean(path)
 }

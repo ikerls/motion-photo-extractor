@@ -25,6 +25,10 @@ type reporter struct {
 	log *slog.Logger
 	out *console
 
+	// deleteOrig is set when originals are to be deleted, so that one that
+	// was kept anyway is pointed out.
+	deleteOrig bool
+
 	total     int
 	nameWidth int
 
@@ -128,6 +132,14 @@ func (r *reporter) extractedFile(file string, res extractor.Result) {
 
 	switch res.OriginalPath {
 	case file:
+		if r.deleteOrig {
+			attrs = append(attrs, "original", "kept")
+			details = append(details, detail{
+				label: "original",
+				value: r.out.warn.Render("kept, not every output was written"),
+				short: r.out.warn.Render("original kept"),
+			})
+		}
 	case "":
 		attrs = append(attrs, "original", "deleted")
 		details = append(details, detail{label: "original", value: "deleted", short: "original deleted"})

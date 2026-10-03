@@ -32,7 +32,9 @@ When more than one file is processed, files that are not motion photos are skipp
 - `--extract-video`: Extract video component (default: true)
 - `-f`, `--force`: Overwrite existing output files
 
-Existing output files are kept and reported unless `--force` is given.
+Existing output files are kept and reported unless `--force` is given. When one is kept, `--delete-orig` leaves the original in place.
+
+Files with the same name in different directories would share their outputs in one output directory. Only the first is extracted; the others are reported as failed and left untouched.
 
 ### Logging Options
 - `-v`, `--verbose`: Also show skipped files and details (same as `--log-level debug`)

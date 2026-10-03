@@ -1,6 +1,7 @@
 package extractor
 
 import (
+	"bytes"
 	"cmp"
 	"fmt"
 	"os"
@@ -22,6 +23,9 @@ type Options struct {
 
 	// Overwrite replaces existing output files. Without it, a component whose
 	// output already exists is left alone and reported in Result.Skipped.
+	//
+	// It never replaces an earlier IMG_original.jpg, unless that file has the
+	// same content as the input.
 	Overwrite bool
 
 	// RenameOriginal gives the extracted files the input's base name
@@ -32,6 +36,10 @@ type Options struct {
 
 	// DeleteOriginal removes the input once extraction has succeeded. Combined
 	// with RenameOriginal the input is deleted instead of renamed.
+	//
+	// The input is only deleted when every requested component was written by
+	// the call. If one is reported in Result.Skipped, DeleteOriginal is
+	// ignored: the existing output may not come from this input.
 	DeleteOriginal bool
 }
 
@@ -43,7 +51,7 @@ type Result struct {
 	VideoPath string
 
 	// OriginalPath is where the input file is now: unchanged, renamed, or
-	// empty if it was deleted.
+	// empty if it was deleted. It is never empty when Skipped is not.
 	OriginalPath string
 
 	// Skipped lists outputs that already existed and were not overwritten.
@@ -117,9 +125,20 @@ func ExtractFile(path string, opts Options) (Result, error) {
 	writePhoto := wanted(out.photo, opts.SkipPhoto, photoReplacesInput)
 	writeVideo := wanted(out.video, opts.SkipVideo, false)
 
-	moveOriginal := opts.RenameOriginal && !opts.DeleteOriginal
-	if moveOriginal && !opts.Overwrite && exists(out.original) {
-		return Result{}, fmt.Errorf("renamed original already exists: %s", out.original)
+	// An output that was already there may have been extracted from another
+	// file, so it is no reason to give up the input.
+	deleteOriginal := opts.DeleteOriginal && len(res.Skipped) == 0
+
+	// An earlier original is not an output and cannot be extracted again, so
+	// Overwrite only replaces it with itself.
+	moveOriginal := opts.RenameOriginal && !deleteOriginal
+	if moveOriginal && exists(out.original) {
+		if !opts.Overwrite {
+			return Result{}, fmt.Errorf("renamed original already exists: %s", out.original)
+		}
+		if !hasContent(out.original, data) {
+			return Result{}, fmt.Errorf("renamed original already exists with different content: %s", out.original)
+		}
 	}
 
 	var created []string
@@ -175,7 +194,7 @@ func ExtractFile(path string, opts Options) (Result, error) {
 		res.PhotoPath = out.photo
 	}
 
-	if opts.DeleteOriginal {
+	if deleteOriginal {
 		// When the photo replaced the input there is nothing left to delete.
 		if !(writePhoto && photoReplacesInput) {
 			if err := os.Remove(path); err != nil {
@@ -186,6 +205,25 @@ func ExtractFile(path string, opts Options) (Result, error) {
 	}
 
 	return res, nil
+}
+
+// Targets returns the paths ExtractFile may write for path with opts: the
+// requested components and, with RenameOriginal, the moved original. Two
+// inputs that share a target cannot both be extracted with the same opts.
+func Targets(path string, opts Options) []string {
+	out := planOutputs(path, cmp.Or(opts.OutputDir, filepath.Dir(path)), opts.RenameOriginal)
+
+	var targets []string
+	if !opts.SkipPhoto {
+		targets = append(targets, out.photo)
+	}
+	if !opts.SkipVideo {
+		targets = append(targets, out.video)
+	}
+	if out.original != "" {
+		targets = append(targets, out.original)
+	}
+	return targets
 }
 
 type outputPaths struct {
@@ -230,6 +268,11 @@ func stageFile(path string, data []byte, modTime time.Time) (string, error) {
 func exists(path string) bool {
 	_, err := os.Lstat(path)
 	return err == nil
+}
+
+func hasContent(path string, want []byte) bool {
+	got, err := os.ReadFile(path)
+	return err == nil && bytes.Equal(got, want)
 }
 
 func isSameFile(path string, info os.FileInfo) bool {

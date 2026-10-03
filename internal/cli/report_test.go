@@ -121,6 +121,46 @@ func TestPrettyReportsKeptOutputs(t *testing.T) {
 	}
 }
 
+func TestPrettyReportsOriginalsKeptDespiteDeleteOrig(t *testing.T) {
+	dir := t.TempDir()
+	writeMotionPhotoFixture(t, filepath.Join(dir, "a.jpg"))
+	if err := os.Mkdir(filepath.Join(dir, "out"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "out", "a_video.mp4"), []byte("existing"), 0644); err != nil {
+		t.Fatalf("write existing video: %v", err)
+	}
+
+	status, got := runPretty(t, dir, "a.jpg", "--output", "out", "--delete-orig")
+	want := strings.Join([]string{
+		"! a.jpg",
+		"  ├─ photo     out/a_photo.jpg  ",
+		"  ├─ video     out/a_video.mp4  already exists, kept",
+		"  └─ original  kept, not every output was written",
+	}, "\n")
+	if status != 0 || !containsLines(got, want) {
+		t.Fatalf("status = %d, output:\n%s\nwant lines starting with:\n%s", status, got, want)
+	}
+	assertFileExists(t, filepath.Join(dir, "a.jpg"))
+}
+
+func TestPrettyExplainsCollidingOutputs(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"a", "b"} {
+		if err := os.MkdirAll(filepath.Join(dir, "in", sub), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		writeMotionPhotoFixture(t, filepath.Join(dir, "in", sub, "IMG.jpg"))
+	}
+
+	status, got := runPretty(t, dir, "in", "--output", "out", "--delete-orig")
+	want := "✗ in/b/IMG.jpg  out/IMG_photo.jpg is already the output of in/a/IMG.jpg, extract this file to another directory\n"
+	if status != 1 || !strings.Contains(got, want) || !strings.Contains(got, "1 extracted · 0 skipped · 1 failed") {
+		t.Fatalf("status = %d, output:\n%s", status, got)
+	}
+	assertFileExists(t, filepath.Join(dir, "in", "b", "IMG.jpg"))
+}
+
 func TestPrettyWarnsWhenNothingMatches(t *testing.T) {
 	status, got := runPretty(t, t.TempDir(), "*.heic")
 	if want := "! *.heic  no supported files found\n"; status != 0 || got != want {
