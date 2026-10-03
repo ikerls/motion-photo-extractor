@@ -53,6 +53,12 @@ func (r *reporter) usingConfig(path string) {
 	r.out.print(slog.LevelDebug, r.out.dim.Render("Using config file "+path))
 }
 
+// ignoredConfig reports a config file that is in a format that is not read.
+func (r *reporter) ignoredConfig(path string) {
+	r.log.Warn("Config file ignored, only YAML and JSON are supported", "path", path)
+	r.out.event(slog.LevelWarn, r.out.warn.Render(symbolWarn), path, "config file ignored, only YAML and JSON are supported")
+}
+
 func (r *reporter) scanning(input string) {
 	r.out.showStatus("Scanning " + input + " …")
 }

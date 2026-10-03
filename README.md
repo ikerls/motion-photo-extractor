@@ -82,7 +82,7 @@ Default config locations:
 - Current directory
 - `$HOME/.config/go-motion-photo`
 
-Only YAML and JSON are read. A config file in another format (such as `go-motion-photo.toml`) is rejected when passed to `--config`, and ignored in the default locations.
+Only YAML and JSON are read. A config file in another format (such as `go-motion-photo.toml`) is rejected when passed to `--config`, and reported and ignored in the default locations.
 
 ## Usage Examples
 

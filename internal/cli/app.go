@@ -58,6 +58,9 @@ func Run(args []string, stdout, stderr io.Writer, version string) int {
 	if cfg.ConfigFile != "" {
 		rep.usingConfig(cfg.ConfigFile)
 	}
+	for _, path := range cfg.IgnoredConfigFiles {
+		rep.ignoredConfig(path)
+	}
 	if len(cfg.Inputs) == 0 {
 		usage.failure(errors.New("no input specified"), usageLine, helpHint)
 		return 1

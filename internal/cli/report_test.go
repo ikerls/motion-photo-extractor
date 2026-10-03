@@ -161,6 +161,20 @@ func TestPrettyExplainsCollidingOutputs(t *testing.T) {
 	assertFileExists(t, filepath.Join(dir, "in", "b", "IMG.jpg"))
 }
 
+func TestPrettyWarnsAboutIgnoredConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	writeMotionPhotoFixture(t, filepath.Join(dir, "a.jpg"))
+	if err := os.WriteFile(filepath.Join(dir, "go-motion-photo.toml"), []byte("output = \"elsewhere\"\n"), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	status, got := runPretty(t, dir, "a.jpg", "--quiet")
+	if want := "! go-motion-photo.toml  config file ignored, only YAML and JSON are supported\n"; status != 0 || got != want {
+		t.Fatalf("status = %d, output = %q, want %q", status, got, want)
+	}
+	assertFileExists(t, filepath.Join(dir, "a_video.mp4"))
+}
+
 func TestPrettyWarnsWhenNothingMatches(t *testing.T) {
 	status, got := runPretty(t, t.TempDir(), "*.heic")
 	if want := "! *.heic  no supported files found\n"; status != 0 || got != want {
