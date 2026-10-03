@@ -1,11 +1,14 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/spf13/pflag"
@@ -31,6 +34,13 @@ type Config struct {
 
 	// ShowVersion is set when --version was passed.
 	ShowVersion bool `yaml:"-"`
+
+	// ConfigFile is the config file that was read, empty if there was none.
+	ConfigFile string `yaml:"-"`
+
+	// IgnoredConfigFiles are config files found in the default locations in
+	// a format that is not read.
+	IgnoredConfigFiles []string `yaml:"-"`
 }
 
 type LogConfig struct {
@@ -42,6 +52,15 @@ type LogConfig struct {
 const (
 	appName   = "go-motion-photo"
 	envPrefix = "GO_MOTION_PHOTO"
+)
+
+var (
+	// configExts are the extensions of the config files that are read.
+	configExts = []string{".yaml", ".yml", ".json"}
+
+	// legacyExts are formats that earlier versions read. A config file in
+	// one of them is pointed out rather than silently left unread.
+	legacyExts = []string{".toml", ".hcl", ".tfvars", ".ini", ".properties", ".props", ".prop", ".env", ".dotenv"}
 )
 
 const Usage = `Usage: go-motion-photo [options] <file|directory|pattern>...
@@ -71,8 +90,9 @@ Logging Options:
   --no-console-log     Disable console logging (only log to file if specified)
 
 Configuration:
-  --config <path>      Path to configuration file
-                       When not specified, searches for 'go-motion-photo.yaml' in:
+  --config <path>      Path to configuration file, YAML or JSON
+                       When not specified, searches for 'go-motion-photo.yaml',
+                       '.yml' or '.json' in:
                        - Current directory
                        - $HOME/.config/go-motion-photo
                        Every config key can also be set through the environment,
@@ -147,13 +167,15 @@ func Load(args []string) (*Config, error) {
 		fromCLI[f.Name] = f.Value.String()
 	})
 
-	data, err := readConfigFile(*configFile)
+	data, path, ignored, err := readConfigFile(*configFile)
+	cfg.ConfigFile = path
 	if err == nil {
-		err = yaml.Unmarshal(data, &file)
+		err = decodeConfig(path, data, &file)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
+	cfg.IgnoredConfigFiles = ignored
 
 	for flagName, key := range flagKeys {
 		name := envName(key)
@@ -185,12 +207,17 @@ func Load(args []string) (*Config, error) {
 	return cfg, nil
 }
 
-// readConfigFile returns the contents of the config file at path, or of the
-// first one found in the default locations when path is empty. Not finding
-// one in the default locations is not an error.
-func readConfigFile(path string) ([]byte, error) {
+// readConfigFile returns the contents and location of the config file at
+// path, or of the first one found in the default locations when path is
+// empty. Not finding one in the default locations is not an error; files
+// found there in a format that is not read are returned in ignored.
+func readConfigFile(path string) (data []byte, location string, ignored []string, err error) {
 	if path != "" {
-		return os.ReadFile(path)
+		if ext := filepath.Ext(path); !slices.Contains(configExts, strings.ToLower(ext)) {
+			return nil, path, nil, fmt.Errorf("unsupported config format %q: use a .yaml, .yml or .json file", ext)
+		}
+		data, err := os.ReadFile(path)
+		return data, path, nil, err
 	}
 
 	dirs := []string{"."}
@@ -199,16 +226,41 @@ func readConfigFile(path string) ([]byte, error) {
 	}
 
 	for _, dir := range dirs {
-		for _, ext := range []string{".yaml", ".yml"} {
-			data, err := os.ReadFile(filepath.Join(dir, appName+ext))
+		for _, ext := range configExts {
+			path := filepath.Join(dir, appName+ext)
+			data, err := os.ReadFile(path)
 			if errors.Is(err, fs.ErrNotExist) {
 				continue
 			}
-			return data, err
+			return data, path, ignored, err
+		}
+		for _, ext := range legacyExts {
+			path := filepath.Join(dir, appName+ext)
+			if info, err := os.Stat(path); err == nil && !info.IsDir() {
+				ignored = append(ignored, path)
+			}
 		}
 	}
 
-	return nil, nil
+	return nil, "", ignored, nil
+}
+
+// decodeConfig parses data, the contents of the config file at path, into v.
+func decodeConfig(path string, data []byte, v any) error {
+	if strings.EqualFold(filepath.Ext(path), ".json") {
+		// The YAML parser reads most JSON, but not all of its string escapes
+		// (a path written as "\/out", for one). JSON is therefore parsed as
+		// such and handed over as YAML, which the config keys are declared for.
+		var doc any
+		if err := json.Unmarshal(bytes.TrimPrefix(data, []byte("\xef\xbb\xbf")), &doc); err != nil {
+			return err
+		}
+		var err error
+		if data, err = yaml.Marshal(doc); err != nil {
+			return err
+		}
+	}
+	return yaml.Unmarshal(data, v)
 }
 
 func envName(key string) string {

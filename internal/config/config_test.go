@@ -176,6 +176,103 @@ func TestLoadReadsConfigFromCurrentDirectory(t *testing.T) {
 	}
 }
 
+func TestLoadReadsJSONConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{name: "compact", content: `{"output":"\/photos\/out","force":true,"log":{"level":"warn"}}`},
+		{name: "indented with tabs", content: "{\n\t\"output\": \"/photos/out\",\n\t\"force\": true,\n\t\"log\": {\n\t\t\"level\": \"warn\"\n\t}\n}\n"},
+		{name: "byte order mark", content: "\xef\xbb\xbf" + `{"output":"/photos/out","force":true,"log":{"level":"warn"}}`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(tempDir, "go-motion-photo.json"), []byte(tc.content), 0644); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+
+			cfg := loadConfigForTestInDir(t, tempDir, "photo.jpg")
+
+			if cfg.ConfigFile != "go-motion-photo.json" {
+				t.Fatalf("ConfigFile = %q, want %q", cfg.ConfigFile, "go-motion-photo.json")
+			}
+			if cfg.OutputDir != "/photos/out" || !cfg.Force || cfg.Log.Level != "warn" {
+				t.Fatalf("OutputDir = %q, Force = %v, Log.Level = %q, want /photos/out, true and warn", cfg.OutputDir, cfg.Force, cfg.Log.Level)
+			}
+			// Keys left out keep their defaults.
+			if !cfg.ExtractPhoto || !cfg.ExtractVideo {
+				t.Fatalf("ExtractPhoto = %v, ExtractVideo = %v, want both true", cfg.ExtractPhoto, cfg.ExtractVideo)
+			}
+		})
+	}
+}
+
+func TestLoadReadsExplicitJSONConfig(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "custom.JSON")
+	if err := os.WriteFile(configPath, []byte(`{"input": "from-file.jpg", "rename_orig": true}`), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg := loadConfigForTest(t, "--config", configPath)
+
+	if !slices.Equal(cfg.Inputs, []string{"from-file.jpg"}) || !cfg.RenameOrig {
+		t.Fatalf("Inputs = %q, RenameOrig = %v, want from-file.jpg and true", cfg.Inputs, cfg.RenameOrig)
+	}
+}
+
+// A config file in a format earlier versions read is not picked up. It is
+// reported, unless a file that is read sits next to it.
+func TestLoadReportsIgnoredConfigFiles(t *testing.T) {
+	home := t.TempDir()
+	configDir := filepath.Join(home, ".config", "go-motion-photo")
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	workDir := t.TempDir()
+	for _, path := range []string{
+		filepath.Join(workDir, "go-motion-photo.toml"),
+		filepath.Join(configDir, "go-motion-photo.ini"),
+	} {
+		if err := os.WriteFile(path, []byte("output = \"from-legacy\"\n"), 0644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+	}
+
+	load := func() *config.Config {
+		t.Helper()
+		t.Chdir(workDir)
+		t.Setenv("HOME", home)
+		cfg, err := config.Load([]string{"photo.jpg"})
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		return cfg
+	}
+
+	cfg := load()
+	want := []string{"go-motion-photo.toml", filepath.Join(configDir, "go-motion-photo.ini")}
+	if cfg.ConfigFile != "" || cfg.OutputDir != "." || !slices.Equal(cfg.IgnoredConfigFiles, want) {
+		t.Fatalf("ConfigFile = %q, OutputDir = %q, IgnoredConfigFiles = %q, want none, . and %q",
+			cfg.ConfigFile, cfg.OutputDir, cfg.IgnoredConfigFiles, want)
+	}
+
+	if err := os.WriteFile(filepath.Join(configDir, "go-motion-photo.yaml"), []byte("output: from-home\n"), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg = load()
+	if cfg.OutputDir != "from-home" || !slices.Equal(cfg.IgnoredConfigFiles, want[:1]) {
+		t.Fatalf("OutputDir = %q, IgnoredConfigFiles = %q, want from-home and %q", cfg.OutputDir, cfg.IgnoredConfigFiles, want[:1])
+	}
+
+	writeConfig(t, workDir, "output: from-work-dir\n")
+	cfg = load()
+	if cfg.OutputDir != "from-work-dir" || len(cfg.IgnoredConfigFiles) != 0 {
+		t.Fatalf("OutputDir = %q, IgnoredConfigFiles = %q, want from-work-dir and none", cfg.OutputDir, cfg.IgnoredConfigFiles)
+	}
+}
+
 func TestLoadReadsEnvironmentBetweenConfigFileAndFlags(t *testing.T) {
 	tempDir := t.TempDir()
 	writeConfig(t, tempDir, "output: from-config\nlog:\n  level: warn\n")
@@ -257,5 +354,17 @@ func TestLoadReadsConfigFromHomeConfigDirectory(t *testing.T) {
 	}
 	if cfg.OutputDir != "from-home" {
 		t.Fatalf("OutputDir = %q, want %q", cfg.OutputDir, "from-home")
+	}
+}
+
+func TestLoadReportsConfigFile(t *testing.T) {
+	if cfg := loadConfigForTest(t, "photo.jpg"); cfg.ConfigFile != "" {
+		t.Fatalf("ConfigFile = %q, want none", cfg.ConfigFile)
+	}
+
+	tempDir := t.TempDir()
+	writeConfig(t, tempDir, "output: from-file\n")
+	if cfg := loadConfigForTestInDir(t, tempDir, "photo.jpg"); cfg.ConfigFile != "go-motion-photo.yaml" {
+		t.Fatalf("ConfigFile = %q, want %q", cfg.ConfigFile, "go-motion-photo.yaml")
 	}
 }

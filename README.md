@@ -52,11 +52,13 @@ Logs are written to standard error.
 Configuration can be provided through, in order of precedence:
 - Command line arguments
 - Environment variables: `GO_MOTION_PHOTO_` followed by the config key, e.g. `GO_MOTION_PHOTO_OUTPUT`, `GO_MOTION_PHOTO_LOG_LEVEL`
-- Configuration file (`go-motion-photo.yaml`)
+- Configuration file (`go-motion-photo.yaml`, `.yml` or `.json`), or the one given with `--config`
 
 Default config locations:
 - Current directory
 - `$HOME/.config/go-motion-photo`
+
+Only YAML and JSON are read. A config file in another format (such as `go-motion-photo.toml`) is rejected when passed to `--config`, and ignored in the default locations.
 
 ## Usage Examples
 
