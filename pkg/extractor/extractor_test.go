@@ -2,146 +2,111 @@ package extractor
 
 import (
 	"bytes"
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
+	"time"
 )
 
-var minimalMP4Data = []byte{
-	0x00, 0x00, 0x00, 0x18,
-	'f', 't', 'y', 'p',
-	'm', 'p', '4', '2',
-	0x00, 0x00, 0x00, 0x00,
-	'i', 's', 'o', 'm',
-	'm', 'p', '4', '2',
-}
-
-func TestProcessExtractsOnlyVideoWhenPhotoDisabled(t *testing.T) {
+func TestExtractFileExtractsOnlyVideoWhenPhotoSkipped(t *testing.T) {
 	tempDir := t.TempDir()
 	input := filepath.Join(tempDir, "sample.jpg")
 	output := filepath.Join(tempDir, "out")
 	writeMotionPhotoFixture(t, input)
 
-	e := New()
-	err := e.Process(input, output, false, false, false, true, false)
+	res, err := ExtractFile(input, Options{OutputDir: output, SkipPhoto: true})
 	if err != nil {
-		t.Fatalf("Process() error = %v", err)
+		t.Fatalf("ExtractFile() error = %v", err)
 	}
 
+	want := Result{
+		VideoPath:    filepath.Join(output, "sample_video.mp4"),
+		OriginalPath: input,
+		Method:       MethodMetadata,
+	}
+	assertResult(t, res, want)
 	assertFileDoesNotExist(t, filepath.Join(output, "sample_photo.jpg"))
-	assertFileExists(t, filepath.Join(output, "sample_video.mp4"))
+	assertFileExists(t, want.VideoPath)
 }
 
-func TestProcessExtractsOnlyPhotoWhenVideoDisabled(t *testing.T) {
+func TestExtractFileExtractsOnlyPhotoWhenVideoSkipped(t *testing.T) {
 	tempDir := t.TempDir()
 	input := filepath.Join(tempDir, "sample.jpg")
 	output := filepath.Join(tempDir, "out")
 	writeMotionPhotoFixture(t, input)
 
-	e := New()
-	err := e.Process(input, output, false, false, true, false, false)
-	if err != nil {
-		t.Fatalf("Process() error = %v", err)
+	if _, err := ExtractFile(input, Options{OutputDir: output, SkipVideo: true}); err != nil {
+		t.Fatalf("ExtractFile() error = %v", err)
 	}
 
 	assertFileExists(t, filepath.Join(output, "sample_photo.jpg"))
 	assertFileDoesNotExist(t, filepath.Join(output, "sample_video.mp4"))
 }
 
-func TestProcessReturnsErrorWhenBothExtractionsDisabled(t *testing.T) {
+func TestExtractFileReturnsErrorWhenBothComponentsSkipped(t *testing.T) {
+	input := filepath.Join(t.TempDir(), "sample.jpg")
+	writeMotionPhotoFixture(t, input)
+
+	_, err := ExtractFile(input, Options{SkipPhoto: true, SkipVideo: true})
+	if !errors.Is(err, ErrNothingToExtract) {
+		t.Fatalf("ExtractFile() error = %v, want ErrNothingToExtract", err)
+	}
+}
+
+func TestExtractFileRejectsUnsupportedExtension(t *testing.T) {
+	input := filepath.Join(t.TempDir(), "sample.png")
+	writeMotionPhotoFixture(t, input)
+
+	_, err := ExtractFile(input, Options{})
+	if !errors.Is(err, ErrUnsupportedExtension) {
+		t.Fatalf("ExtractFile() error = %v, want ErrUnsupportedExtension", err)
+	}
+}
+
+func TestExtractFileDefaultsToInputDirectoryAndKeepsModTime(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "sample.jpg")
+	writeMotionPhotoFixture(t, input)
+	modTime := time.Date(2021, 3, 4, 5, 6, 7, 0, time.UTC)
+	if err := os.Chtimes(input, modTime, modTime); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	res, err := ExtractFile(input, Options{})
+	if err != nil {
+		t.Fatalf("ExtractFile() error = %v", err)
+	}
+
+	want := Result{
+		PhotoPath:    filepath.Join(tempDir, "sample_photo.jpg"),
+		VideoPath:    filepath.Join(tempDir, "sample_video.mp4"),
+		OriginalPath: input,
+		Method:       MethodMetadata,
+	}
+	assertResult(t, res, want)
+
+	for _, path := range []string{want.PhotoPath, want.VideoPath} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		if !info.ModTime().Equal(modTime) {
+			t.Fatalf("%s mod time = %v, want %v", path, info.ModTime(), modTime)
+		}
+	}
+	assertDirEntries(t, tempDir, "sample.jpg", "sample_photo.jpg", "sample_video.mp4")
+}
+
+func TestExtractFileSanitizesPhotoAndRejectsSecondPass(t *testing.T) {
 	tempDir := t.TempDir()
 	input := filepath.Join(tempDir, "sample.jpg")
 	output := filepath.Join(tempDir, "out")
 	writeMotionPhotoFixture(t, input)
 
-	e := New()
-	err := e.Process(input, output, false, false, false, false, false)
-	if err == nil {
-		t.Fatal("Process() error = nil, want non-nil")
-	}
-}
-
-func TestSplitContentPrefersMetadataOverStrayMPVDAndTrimsPadding(t *testing.T) {
-	e := New()
-	mp4Data := append([]byte(nil), minimalMP4Data...)
-
-	xmp := []byte(fmt.Sprintf(`<x:xmpmeta><rdf:RDF><rdf:Description `+
-		`xmlns:GCamera="http://ns.google.com/photos/1.0/camera/" `+
-		`xmlns:Container="http://ns.google.com/photos/1.0/container/" `+
-		`xmlns:Item="http://ns.google.com/photos/1.0/container/item/" `+
-		`GCamera:MotionPhoto="1" `+
-		`GCamera:MotionPhotoOffset="%d">`+
-		`<Container:Directory><rdf:Seq>`+
-		`<rdf:li rdf:parseType="Resource"><Container:Item Item:Mime="image/jpeg" Item:Semantic="Primary" Item:Length="0" Item:Padding="5"/></rdf:li>`+
-		`<rdf:li rdf:parseType="Resource"><Container:Item Item:Mime="video/mp4" Item:Semantic="MotionPhoto" Item:Length="%d" Item:Padding="0"/></rdf:li>`+
-		`</rdf:Seq></Container:Directory></rdf:Description></rdf:RDF></x:xmpmeta>`, len(mp4Data), len(mp4Data)))
-
-	jpegData := append([]byte{0xFF, 0xD8}, xmp...)
-	jpegData = append(jpegData, []byte("stray-mpvd-inside-jpeg")...)
-	jpegData = append(jpegData, 0xFF, 0xD9)
-
-	padding := []byte("ABCDE")
-	motionPhoto := append(append([]byte{}, jpegData...), padding...)
-	motionPhoto = append(motionPhoto, mp4Data...)
-
-	extractedJPEG, extractedMP4, err := e.splitContent(motionPhoto)
-	if err != nil {
-		t.Fatalf("splitContent() error = %v", err)
-	}
-
-	if !bytes.Equal(extractedJPEG, jpegData) {
-		t.Fatalf("unexpected JPEG extraction: got %q want %q", extractedJPEG, jpegData)
-	}
-
-	if !bytes.Equal(extractedMP4, mp4Data) {
-		t.Fatalf("unexpected MP4 extraction: got %q want %q", extractedMP4, mp4Data)
-	}
-}
-
-func TestSplitContentFallsBackToMarkerWhenMetadataCandidateIsStale(t *testing.T) {
-	e := New()
-	wantJPEG, motionPhoto := buildMotionPhotoFixture(minimalMP4Data, len(minimalMP4Data)+4, true)
-
-	extractedJPEG, extractedMP4, err := e.splitContent(motionPhoto)
-	if err != nil {
-		t.Fatalf("splitContent() error = %v", err)
-	}
-
-	if !bytes.Equal(extractedJPEG, wantJPEG) {
-		t.Fatalf("unexpected JPEG extraction: got %q want %q", extractedJPEG, wantJPEG)
-	}
-
-	if !bytes.Equal(extractedMP4, minimalMP4Data) {
-		t.Fatalf("unexpected MP4 extraction: got %q want %q", extractedMP4, minimalMP4Data)
-	}
-}
-
-func TestSplitContentRejectsStrayMPVDAfterJPEGEnd(t *testing.T) {
-	e := New()
-	_, _, err := e.splitContent(buildTrailingMPVDFalsePositive())
-	if err == nil {
-		t.Fatal("splitContent() error = nil, want non-nil")
-	}
-}
-
-func TestSplitContentRejectsStrayMPVDInsideJPEGData(t *testing.T) {
-	e := New()
-	_, _, err := e.splitContent(buildEmbeddedMPVDFalsePositive())
-	if err == nil {
-		t.Fatal("splitContent() error = nil, want non-nil")
-	}
-}
-
-func TestProcessSanitizesExtractedPhotoAndRejectsSecondPass(t *testing.T) {
-	tempDir := t.TempDir()
-	input := filepath.Join(tempDir, "sample.jpg")
-	output := filepath.Join(tempDir, "out")
-	writeMotionPhotoFixture(t, input)
-
-	e := New()
-	if err := e.Process(input, output, false, false, true, true, false); err != nil {
-		t.Fatalf("Process() error = %v", err)
+	if _, err := ExtractFile(input, Options{OutputDir: output}); err != nil {
+		t.Fatalf("ExtractFile() error = %v", err)
 	}
 
 	photoPath := filepath.Join(output, "sample_photo.jpg")
@@ -161,13 +126,158 @@ func TestProcessSanitizesExtractedPhotoAndRejectsSecondPass(t *testing.T) {
 	}
 
 	secondOutput := filepath.Join(tempDir, "out-second-pass")
-	err = e.Process(photoPath, secondOutput, false, false, true, true, false)
-	if err == nil {
-		t.Fatal("Process() error = nil on extracted photo, want non-nil")
+	_, err = ExtractFile(photoPath, Options{OutputDir: secondOutput})
+	if !errors.Is(err, ErrNotMotionPhoto) {
+		t.Fatalf("ExtractFile() error = %v on extracted photo, want ErrNotMotionPhoto", err)
 	}
 
 	assertFileDoesNotExist(t, filepath.Join(secondOutput, "sample_photo_photo.jpg"))
 	assertFileDoesNotExist(t, filepath.Join(secondOutput, "sample_photo_video.mp4"))
+}
+
+func TestExtractFileLeavesExistingOutputsUnlessOverwrite(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "sample.jpg")
+	writeMotionPhotoFixture(t, input)
+	photoPath := filepath.Join(tempDir, "sample_photo.jpg")
+	if err := os.WriteFile(photoPath, []byte("existing"), 0644); err != nil {
+		t.Fatalf("write existing photo: %v", err)
+	}
+
+	res, err := ExtractFile(input, Options{})
+	if err != nil {
+		t.Fatalf("ExtractFile() error = %v", err)
+	}
+	assertResult(t, res, Result{
+		VideoPath:    filepath.Join(tempDir, "sample_video.mp4"),
+		OriginalPath: input,
+		Skipped:      []string{photoPath},
+		Method:       MethodMetadata,
+	})
+	assertFileContent(t, photoPath, []byte("existing"))
+
+	res, err = ExtractFile(input, Options{Overwrite: true})
+	if err != nil {
+		t.Fatalf("ExtractFile() with Overwrite error = %v", err)
+	}
+	if res.PhotoPath != photoPath || len(res.Skipped) != 0 {
+		t.Fatalf("ExtractFile() with Overwrite = %+v, want photo written and nothing skipped", res)
+	}
+	if data, _ := os.ReadFile(photoPath); bytes.Equal(data, []byte("existing")) {
+		t.Fatal("existing photo was not overwritten")
+	}
+}
+
+// With RenameOriginal and no separate output directory the photo takes the
+// input's name. The input must end up as _original, not be overwritten.
+func TestExtractFileRenameOriginalInPlace(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "sample.jpg")
+	writeMotionPhotoFixture(t, input)
+	original, err := os.ReadFile(input)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+
+	res, err := ExtractFile(input, Options{RenameOriginal: true})
+	if err != nil {
+		t.Fatalf("ExtractFile() error = %v", err)
+	}
+
+	want := Result{
+		PhotoPath:    input,
+		VideoPath:    filepath.Join(tempDir, "sample.mp4"),
+		OriginalPath: filepath.Join(tempDir, "sample_original.jpg"),
+		Method:       MethodMetadata,
+	}
+	assertResult(t, res, want)
+	assertDirEntries(t, tempDir, "sample.jpg", "sample.mp4", "sample_original.jpg")
+	assertFileContent(t, want.OriginalPath, original)
+
+	if _, err := ExtractFile(input, Options{}); !errors.Is(err, ErrNotMotionPhoto) {
+		t.Fatalf("ExtractFile() on extracted photo error = %v, want ErrNotMotionPhoto", err)
+	}
+}
+
+func TestExtractFileRenameOriginalRefusesToClobberEarlierOriginal(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "sample.jpg")
+	writeMotionPhotoFixture(t, input)
+	earlier := filepath.Join(tempDir, "sample_original.jpg")
+	if err := os.WriteFile(earlier, []byte("earlier"), 0644); err != nil {
+		t.Fatalf("write earlier original: %v", err)
+	}
+
+	if _, err := ExtractFile(input, Options{RenameOriginal: true}); err == nil {
+		t.Fatal("ExtractFile() error = nil, want non-nil")
+	}
+
+	assertDirEntries(t, tempDir, "sample.jpg", "sample_original.jpg")
+	assertFileContent(t, earlier, []byte("earlier"))
+}
+
+func TestExtractFileDeleteOriginal(t *testing.T) {
+	t.Run("separate outputs", func(t *testing.T) {
+		tempDir := t.TempDir()
+		input := filepath.Join(tempDir, "sample.jpg")
+		writeMotionPhotoFixture(t, input)
+
+		res, err := ExtractFile(input, Options{DeleteOriginal: true})
+		if err != nil {
+			t.Fatalf("ExtractFile() error = %v", err)
+		}
+		if res.OriginalPath != "" {
+			t.Fatalf("OriginalPath = %q, want empty", res.OriginalPath)
+		}
+		assertDirEntries(t, tempDir, "sample_photo.jpg", "sample_video.mp4")
+	})
+
+	t.Run("photo replaces input", func(t *testing.T) {
+		tempDir := t.TempDir()
+		input := filepath.Join(tempDir, "sample.jpg")
+		writeMotionPhotoFixture(t, input)
+
+		res, err := ExtractFile(input, Options{DeleteOriginal: true, RenameOriginal: true})
+		if err != nil {
+			t.Fatalf("ExtractFile() error = %v", err)
+		}
+		if res.PhotoPath != input || res.OriginalPath != "" {
+			t.Fatalf("ExtractFile() = %+v, want photo at %s and no original", res, input)
+		}
+		assertDirEntries(t, tempDir, "sample.jpg", "sample.mp4")
+
+		if _, err := ExtractFile(input, Options{}); !errors.Is(err, ErrNotMotionPhoto) {
+			t.Fatalf("ExtractFile() on extracted photo error = %v, want ErrNotMotionPhoto", err)
+		}
+	})
+}
+
+func TestExtractFileLeavesNothingBehindWhenNotAMotionPhoto(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "plain.jpg")
+	if err := os.WriteFile(input, buildTrailingMPVDFalsePositive(), 0644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	_, err := ExtractFile(input, Options{OutputDir: filepath.Join(tempDir, "out"), DeleteOriginal: true})
+	if !errors.Is(err, ErrNotMotionPhoto) {
+		t.Fatalf("ExtractFile() error = %v, want ErrNotMotionPhoto", err)
+	}
+	assertDirEntries(t, tempDir, "plain.jpg")
+}
+
+func TestProcessStillWorks(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "sample.jpg")
+	output := filepath.Join(tempDir, "out")
+	writeMotionPhotoFixture(t, input)
+
+	if err := New().Process(input, output, false, false, false, true, false); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+
+	assertFileDoesNotExist(t, filepath.Join(output, "sample_photo.jpg"))
+	assertFileExists(t, filepath.Join(output, "sample_video.mp4"))
 }
 
 func writeMotionPhotoFixture(t *testing.T, path string) {
@@ -178,47 +288,39 @@ func writeMotionPhotoFixture(t *testing.T, path string) {
 	}
 }
 
-func buildMotionPhotoFixture(mp4Data []byte, metadataLength int, includeMarker bool) ([]byte, []byte) {
-	xmp := []byte(fmt.Sprintf(`<x:xmpmeta><rdf:RDF><rdf:Description `+
-		`xmlns:GCamera="http://ns.google.com/photos/1.0/camera/" `+
-		`xmlns:Container="http://ns.google.com/photos/1.0/container/" `+
-		`xmlns:Item="http://ns.google.com/photos/1.0/container/item/" `+
-		`GCamera:MotionPhoto="1" `+
-		`GCamera:MotionPhotoVersion="1" `+
-		`GCamera:MotionPhotoPresentationTimestampUs="123456" `+
-		`GCamera:MotionPhotoOffset="%d">`+
-		`<Container:Directory><rdf:Seq>`+
-		`<rdf:li rdf:parseType="Resource"><Container:Item Item:Mime="image/jpeg" Item:Semantic="Primary" Item:Length="0" Item:Padding="5"/></rdf:li>`+
-		`<rdf:li rdf:parseType="Resource"><Container:Item Item:Mime="video/mp4" Item:Semantic="MotionPhoto" Item:Length="%d" Item:Padding="0"/></rdf:li>`+
-		`</rdf:Seq></Container:Directory></rdf:Description></rdf:RDF></x:xmpmeta>`, metadataLength, metadataLength))
-
-	jpegData := append([]byte{0xFF, 0xD8}, xmp...)
-	jpegData = append(jpegData, []byte("stray-mpvd-inside-jpeg")...)
-	jpegData = append(jpegData, 0xFF, 0xD9)
-
-	motionPhoto := append([]byte{}, jpegData...)
-	if includeMarker {
-		motionPhoto = append(motionPhoto, magicV1...)
+func assertResult(t *testing.T, got, want Result) {
+	t.Helper()
+	if got.PhotoPath != want.PhotoPath || got.VideoPath != want.VideoPath ||
+		got.OriginalPath != want.OriginalPath || got.Method != want.Method ||
+		!slices.Equal(got.Skipped, want.Skipped) {
+		t.Fatalf("ExtractFile() = %+v, want %+v", got, want)
 	}
-	motionPhoto = append(motionPhoto, mp4Data...)
-
-	return jpegData, motionPhoto
 }
 
-func buildTrailingMPVDFalsePositive() []byte {
-	jpegData := append([]byte{0xFF, 0xD8}, []byte("plain-jpeg-data")...)
-	jpegData = append(jpegData, 0xFF, 0xD9)
-
-	data := append([]byte{}, jpegData...)
-	data = append(data, bytes.Repeat([]byte{0x00}, 32)...)
-	data = append(data, []byte("mpvdnot-an-mp4-payload")...)
-	return data
+func assertDirEntries(t *testing.T, dir string, want ...string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir %s: %v", dir, err)
+	}
+	var got []string
+	for _, entry := range entries {
+		got = append(got, entry.Name())
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("entries of %s = %q, want %q", dir, got, want)
+	}
 }
 
-func buildEmbeddedMPVDFalsePositive() []byte {
-	data := append([]byte{0xFF, 0xD8}, []byte("jpeg-body-with-mpvd-inside")...)
-	data = append(data, 0xFF, 0xD9)
-	return data
+func assertFileContent(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("content of %s = %q, want %q", path, got, want)
+	}
 }
 
 func assertFileExists(t *testing.T, path string) {

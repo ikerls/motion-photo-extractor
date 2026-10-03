@@ -1,21 +1,20 @@
 package config_test
 
 import (
-	"io"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/ikerls/motion-photo-extractor/internal/config"
-	"github.com/spf13/pflag"
-	"github.com/spf13/viper"
 )
 
 func TestLoadAppliesDefaults(t *testing.T) {
 	cfg := loadConfigForTest(t, "photo.jpg")
 
-	if cfg.InputFile != "photo.jpg" {
-		t.Fatalf("InputFile = %q, want %q", cfg.InputFile, "photo.jpg")
+	if !slices.Equal(cfg.Inputs, []string{"photo.jpg"}) {
+		t.Fatalf("Inputs = %q, want %q", cfg.Inputs, []string{"photo.jpg"})
 	}
 	if cfg.OutputDir != "." {
 		t.Fatalf("OutputDir = %q, want %q", cfg.OutputDir, ".")
@@ -40,19 +39,36 @@ func TestLoadAppliesDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadUsesPositionalInputWhenFlagIsMissing(t *testing.T) {
-	cfg := loadConfigForTest(t, "movie.heic")
+func TestLoadUsesAllPositionalInputsWhenFlagIsMissing(t *testing.T) {
+	cfg := loadConfigForTest(t, "movie.heic", "other.jpg")
 
-	if cfg.InputFile != "movie.heic" {
-		t.Fatalf("InputFile = %q, want %q", cfg.InputFile, "movie.heic")
+	want := []string{"movie.heic", "other.jpg"}
+	if !slices.Equal(cfg.Inputs, want) {
+		t.Fatalf("Inputs = %q, want %q", cfg.Inputs, want)
 	}
 }
 
 func TestLoadPrefersInputFlagOverPositionalArg(t *testing.T) {
 	cfg := loadConfigForTest(t, "--input", "from-flag.jpg", "from-positional.jpg")
 
-	if cfg.InputFile != "from-flag.jpg" {
-		t.Fatalf("InputFile = %q, want %q", cfg.InputFile, "from-flag.jpg")
+	want := []string{"from-flag.jpg"}
+	if !slices.Equal(cfg.Inputs, want) {
+		t.Fatalf("Inputs = %q, want %q", cfg.Inputs, want)
+	}
+}
+
+func TestLoadPrefersPositionalArgOverConfigFileInput(t *testing.T) {
+	tempDir := t.TempDir()
+	writeConfig(t, tempDir, "input: from-config.jpg\n")
+
+	cfg := loadConfigForTestInDir(t, tempDir, "from-positional.jpg")
+	if want := []string{"from-positional.jpg"}; !slices.Equal(cfg.Inputs, want) {
+		t.Fatalf("Inputs = %q, want %q", cfg.Inputs, want)
+	}
+
+	cfg = loadConfigForTestInDir(t, tempDir)
+	if want := []string{"from-config.jpg"}; !slices.Equal(cfg.Inputs, want) {
+		t.Fatalf("Inputs = %q, want %q", cfg.Inputs, want)
 	}
 }
 
@@ -70,8 +86,8 @@ func TestLoadParsesKebabCaseCLIFlags(t *testing.T) {
 		"--force",
 	)
 
-	if cfg.InputFile != "photo.jpg" {
-		t.Fatalf("InputFile = %q, want %q", cfg.InputFile, "photo.jpg")
+	if !slices.Equal(cfg.Inputs, []string{"photo.jpg"}) {
+		t.Fatalf("Inputs = %q, want %q", cfg.Inputs, []string{"photo.jpg"})
 	}
 	if cfg.OutputDir != "./out" {
 		t.Fatalf("OutputDir = %q, want %q", cfg.OutputDir, "./out")
@@ -104,7 +120,7 @@ func TestLoadParsesKebabCaseCLIFlags(t *testing.T) {
 
 func TestLoadAllowsKebabCaseCLIToOverrideConfigFile(t *testing.T) {
 	tempDir := t.TempDir()
-	configPath := filepath.Join(tempDir, "go-motion-photo.yaml")
+	configPath := filepath.Join(tempDir, "custom.yaml")
 	configContent := []byte("delete_orig: false\nrename_orig: false\nextract_photo: true\nextract_video: true\nlog:\n  level: info\n  no_console: false\n")
 	if err := os.WriteFile(configPath, configContent, 0644); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -142,59 +158,79 @@ func TestLoadAllowsKebabCaseCLIToOverrideConfigFile(t *testing.T) {
 
 func TestLoadReadsConfigFromCurrentDirectory(t *testing.T) {
 	tempDir := t.TempDir()
-	configPath := filepath.Join(tempDir, "go-motion-photo.yaml")
-	configContent := []byte("output: from-config\nlog:\n  level: warn\n")
-	if err := os.WriteFile(configPath, configContent, 0644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
+	writeConfig(t, tempDir, "output: from-config\nextract_video: false\nforce: true\nlog:\n  level: warn\n")
 
 	cfg := loadConfigForTestInDir(t, tempDir, "--input", "photo.jpg")
 
 	if cfg.OutputDir != "from-config" {
 		t.Fatalf("OutputDir = %q, want %q", cfg.OutputDir, "from-config")
 	}
+	if cfg.ExtractVideo {
+		t.Fatal("ExtractVideo = true, want false")
+	}
+	if !cfg.Force {
+		t.Fatal("Force = false, want true")
+	}
 	if cfg.Log.Level != "warn" {
 		t.Fatalf("Log.Level = %q, want %q", cfg.Log.Level, "warn")
 	}
 }
 
-func loadConfigForTest(t *testing.T, args ...string) *config.Config {
-	t.Helper()
-
+func TestLoadReadsEnvironmentBetweenConfigFileAndFlags(t *testing.T) {
 	tempDir := t.TempDir()
-	return loadConfigForTestInDir(t, tempDir, args...)
+	writeConfig(t, tempDir, "output: from-config\nlog:\n  level: warn\n")
+	t.Setenv("GO_MOTION_PHOTO_OUTPUT", "from-env")
+	t.Setenv("GO_MOTION_PHOTO_LOG_LEVEL", "error")
+	t.Setenv("GO_MOTION_PHOTO_DELETE_ORIG", "true")
+
+	cfg := loadConfigForTestInDir(t, tempDir, "--log-level", "debug", "photo.jpg")
+
+	if cfg.OutputDir != "from-env" {
+		t.Fatalf("OutputDir = %q, want %q", cfg.OutputDir, "from-env")
+	}
+	if !cfg.DeleteOrig {
+		t.Fatal("DeleteOrig = false, want true")
+	}
+	if cfg.Log.Level != "debug" {
+		t.Fatalf("Log.Level = %q, want %q", cfg.Log.Level, "debug")
+	}
 }
 
+func TestLoadReportsHelpAndVersion(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	if _, err := config.Load([]string{"--help"}); !errors.Is(err, config.ErrHelp) {
+		t.Fatalf("Load(--help) error = %v, want ErrHelp", err)
+	}
+
+	cfg := loadConfigForTest(t, "--version")
+	if !cfg.ShowVersion {
+		t.Fatal("ShowVersion = false, want true")
+	}
+}
+
+func writeConfig(t *testing.T, dir, content string) {
+	t.Helper()
+	path := filepath.Join(dir, "go-motion-photo.yaml")
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
+func loadConfigForTest(t *testing.T, args ...string) *config.Config {
+	t.Helper()
+	return loadConfigForTestInDir(t, t.TempDir(), args...)
+}
+
+// loadConfigForTestInDir runs Load with dir as both working directory and
+// home, the two places a config file is searched for.
 func loadConfigForTestInDir(t *testing.T, dir string, args ...string) *config.Config {
 	t.Helper()
 
-	originalArgs := os.Args
-	originalDir, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
-
-	if err := os.Chdir(dir); err != nil {
-		t.Fatalf("chdir: %v", err)
-	}
+	t.Chdir(dir)
 	t.Setenv("HOME", dir)
 
-	pflag.CommandLine = pflag.NewFlagSet("test", pflag.ContinueOnError)
-	pflag.CommandLine.SetOutput(io.Discard)
-	viper.Reset()
-	os.Args = append([]string{"go-motion-photo"}, args...)
-
-	t.Cleanup(func() {
-		os.Args = originalArgs
-		pflag.CommandLine = pflag.NewFlagSet(os.Args[0], pflag.ExitOnError)
-		pflag.CommandLine.SetOutput(io.Discard)
-		viper.Reset()
-		if err := os.Chdir(originalDir); err != nil {
-			t.Fatalf("restore chdir: %v", err)
-		}
-	})
-
-	cfg, err := config.Load()
+	cfg, err := config.Load(args)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}

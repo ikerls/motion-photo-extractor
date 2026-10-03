@@ -1,8 +1,8 @@
 run:
-	go run ./cmd/cli/main.go
+	go run ./cmd/go-motion-photo
 
 build:
-	go build ./cmd/cli/main.go
+	go build -o bin/go-motion-photo ./cmd/go-motion-photo
 
 test:
 	go test ./...

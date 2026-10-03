@@ -9,30 +9,49 @@ import (
 	"github.com/spf13/viper"
 )
 
+// ErrHelp is returned by Load when --help was requested.
+var ErrHelp = pflag.ErrHelp
+
 type Config struct {
-	InputFile    string `mapstructure:"input"`
-	OutputDir    string `mapstructure:"output"`
-	DeleteOrig   bool   `mapstructure:"delete_orig"`
-	RenameOrig   bool   `mapstructure:"rename_orig"`
-	ExtractPhoto bool   `mapstructure:"extract_photo"`
-	ExtractVideo bool   `mapstructure:"extract_video"`
-	Force        bool   `mapstructure:"force"`
-	Log          struct {
-		File      string `mapstructure:"file"`
-		Level     string `mapstructure:"level"`
-		NoConsole bool   `mapstructure:"no_console"`
-	} `mapstructure:"log"`
+	// Inputs holds the files, directories or patterns to process. It comes
+	// from --input, the positional arguments, or the "input" config key, in
+	// that order of preference.
+	Inputs []string `mapstructure:"-"`
+
+	OutputDir    string    `mapstructure:"output"`
+	DeleteOrig   bool      `mapstructure:"delete_orig"`
+	RenameOrig   bool      `mapstructure:"rename_orig"`
+	ExtractPhoto bool      `mapstructure:"extract_photo"`
+	ExtractVideo bool      `mapstructure:"extract_video"`
+	Force        bool      `mapstructure:"force"`
+	Log          LogConfig `mapstructure:"log"`
+
+	// ShowVersion is set when --version was passed.
+	ShowVersion bool `mapstructure:"-"`
 }
 
-const usage = `Usage: go-motion-photo [--input <file|directory|/regex/>] [options]
+type LogConfig struct {
+	File      string `mapstructure:"file"`
+	Level     string `mapstructure:"level"`
+	NoConsole bool   `mapstructure:"no_console"`
+}
+
+const (
+	appName   = "go-motion-photo"
+	envPrefix = "GO_MOTION_PHOTO"
+)
+
+const Usage = `Usage: go-motion-photo [options] <file|directory|pattern>...
 
 Arguments:
-  <file>               Motion photo file (same as --input)
+  <file>...            One or more motion photo files, directories or patterns
 
 Input Options:
   --input <path>       Path to a motion photo file or directory with supported files
                        Supported formats: .jpg, .jpeg, .heic
+                       Glob patterns are expanded: 'photos/*.jpg'
                        For regex patterns, enclose pattern in forward slashes: /pattern/
+                       (matched against file names in the current directory)
 
 Output Options:
   --output <dir>       Directory to save extracted files (default: ".")
@@ -53,9 +72,19 @@ Configuration:
                        When not specified, searches for 'go-motion-photo.yaml' in:
                        - Current directory
                        - $HOME/.config/go-motion-photo
+                       Every config key can also be set through the environment,
+                       e.g. GO_MOTION_PHOTO_OUTPUT, GO_MOTION_PHOTO_LOG_LEVEL
+
+Other:
+  --version            Print version and exit
+  --help               Show this help
+
+When more than one file is processed, files that are not motion photos are skipped.
+The exit status is 1 if any file failed.
 
 Examples:
   go-motion-photo photo.jpg                                # Process single file
+  go-motion-photo a.jpg b.jpg c.heic                       # Process several files
   go-motion-photo --input photo.jpg --output ./extracted   # Specify output location
   go-motion-photo --input ./photos                         # Process all supported files in directory
   go-motion-photo --input /IMG_\d{4}\.jpg/                 # Process files matching regex pattern
@@ -63,81 +92,81 @@ Examples:
   go-motion-photo --input photo.jpg --extract-video=false  # Extract only photo component
   go-motion-photo --input photo.heic --force               # Process HEIC file and overwrite existing outputs`
 
-func Load() (*Config, error) {
-	pflag.String("input", "", "Input motion photo file or directory path (*.jpg, *.jpeg, *.heic)")
-	pflag.String("output", ".", "Directory to save extracted files")
-	pflag.Bool("delete-orig", false, "Delete original file after successful extraction")
-	pflag.Bool("rename-orig", false, "Rename original file and don't append _photo/_video to extracted files")
-	pflag.Bool("extract-photo", true, "Extract photo part")
-	pflag.Bool("extract-video", true, "Extract video part")
-	pflag.String("config", "", "Config file path (optional)")
-	pflag.Bool("force", false, "Force overwrite existing files")
-	pflag.String("log-file", "", "Log to file")
-	pflag.Bool("no-console-log", false, "Disable console logging")
-	pflag.String("log-level", "info", "Log level (debug, info, warn, error)")
+// flagKeys maps each CLI flag to the config key it sets.
+var flagKeys = map[string]string{
+	"input":          "input",
+	"output":         "output",
+	"delete-orig":    "delete_orig",
+	"rename-orig":    "rename_orig",
+	"extract-photo":  "extract_photo",
+	"extract-video":  "extract_video",
+	"force":          "force",
+	"log-file":       "log.file",
+	"log-level":      "log.level",
+	"no-console-log": "log.no_console",
+}
 
-	pflag.Usage = func() {
-		fmt.Println(usage)
+// Load builds the configuration from args (without the program name), the
+// environment and the config file. Precedence, highest first: CLI flags,
+// environment variables, config file, defaults.
+func Load(args []string) (*Config, error) {
+	fs := pflag.NewFlagSet(appName, pflag.ContinueOnError)
+	fs.Usage = func() {}
+	fs.String("input", "", "Input motion photo file or directory path (*.jpg, *.jpeg, *.heic)")
+	fs.String("output", ".", "Directory to save extracted files")
+	fs.Bool("delete-orig", false, "Delete original file after successful extraction")
+	fs.Bool("rename-orig", false, "Rename original file and don't append _photo/_video to extracted files")
+	fs.Bool("extract-photo", true, "Extract photo part")
+	fs.Bool("extract-video", true, "Extract video part")
+	fs.Bool("force", false, "Force overwrite existing files")
+	fs.String("log-file", "", "Log to file")
+	fs.String("log-level", "info", "Log level (debug, info, warn, error)")
+	fs.Bool("no-console-log", false, "Disable console logging")
+	configFile := fs.String("config", "", "Config file path (optional)")
+	showVersion := fs.Bool("version", false, "Print version and exit")
+
+	if err := fs.Parse(args); err != nil {
+		return nil, err
 	}
-	pflag.Parse()
 
-	if err := viper.BindPFlags(pflag.CommandLine); err != nil {
-		return nil, fmt.Errorf("failed to bind CLI flags: %w", err)
+	v := viper.New()
+	for flagName, key := range flagKeys {
+		if err := v.BindPFlag(key, fs.Lookup(flagName)); err != nil {
+			return nil, fmt.Errorf("failed to bind CLI flags: %w", err)
+		}
 	}
 
-	// Handle positional arguments
-	args := pflag.Args()
-	if viper.GetString("input") == "" && len(args) > 0 {
-		viper.Set("input", args[0])
-	}
+	v.SetEnvPrefix(envPrefix)
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
 
-	if configFile := viper.GetString("config"); configFile != "" {
-		viper.SetConfigFile(configFile)
+	if *configFile != "" {
+		v.SetConfigFile(*configFile)
 	} else {
-		viper.SetConfigName("go-motion-photo")
-		viper.AddConfigPath(".")
-		viper.AddConfigPath("$HOME/.config/go-motion-photo")
+		v.SetConfigName(appName)
+		v.AddConfigPath(".")
+		v.AddConfigPath("$HOME/.config/" + appName)
 	}
 
-	viper.SetDefault("output", ".")
-	viper.SetDefault("extract_photo", true)
-	viper.SetDefault("extract_video", true)
-	viper.SetDefault("log.level", "info")
-	viper.SetDefault("log.no_console", false)
-
-	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
-
-	if err := viper.ReadInConfig(); err != nil {
+	if err := v.ReadInConfig(); err != nil {
 		if _, ok := errors.AsType[viper.ConfigFileNotFoundError](err); !ok {
 			return nil, fmt.Errorf("failed to read config file: %w", err)
 		}
 	}
 
-	applyCLIOverrides()
-
-	var cfg Config
-	if err := viper.Unmarshal(&cfg); err != nil {
+	cfg := Config{ShowVersion: *showVersion}
+	if err := v.Unmarshal(&cfg); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal configuration: %w", err)
 	}
 
+	switch input := v.GetString("input"); {
+	case fs.Changed("input"):
+		cfg.Inputs = []string{input}
+	case fs.NArg() > 0:
+		cfg.Inputs = fs.Args()
+	case input != "":
+		cfg.Inputs = []string{input}
+	}
+
 	return &cfg, nil
-}
-
-func applyCLIOverrides() {
-	overrides := map[string]string{
-		"delete-orig":    "delete_orig",
-		"rename-orig":    "rename_orig",
-		"extract-photo":  "extract_photo",
-		"extract-video":  "extract_video",
-		"log-file":       "log.file",
-		"log-level":      "log.level",
-		"no-console-log": "log.no_console",
-	}
-
-	for flagName, configKey := range overrides {
-		flag := pflag.Lookup(flagName)
-		if flag != nil && flag.Changed {
-			viper.Set(configKey, viper.Get(flagName))
-		}
-	}
 }

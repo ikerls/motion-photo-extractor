@@ -10,7 +10,7 @@ release:
 
 builds:
   - id: go-motion-photo
-    main: ./cmd/cli/main.go
+    main: ./cmd/go-motion-photo
     env:
       - CGO_ENABLED=0
     goos:
