@@ -34,6 +34,8 @@ const (
 // Parts is a motion photo split into its components.
 type Parts struct {
 	// Photo and Video alias the data passed to Split; they are not copies.
+	// What lies between them or follows the video, such as the directory
+	// Samsung ends its files with, is in neither.
 	Photo  []byte
 	Video  []byte
 	Method Method
@@ -53,6 +55,18 @@ func Split(data []byte) (Parts, error) {
 		return Parts{}, err
 	}
 
+	videoEnd := b.videoStart + mp4Length(data[b.videoStart:])
+
+	// HEIC motion photos carry the video inside an mpvd box. Its header is
+	// not part of the image. What follows the box is not part of the video,
+	// if the box is one that holds the video whole.
+	if start, end, ok := mpvdBox(data, b.videoStart); ok {
+		b.photoEnd = min(b.photoEnd, start)
+		if walk := walkMP4(data[b.videoStart:end]); walk.whole() && b.videoStart+walk.length == end {
+			videoEnd = end
+		}
+	}
+
 	if bytes.HasPrefix(data, jpegSOI) {
 		// Drop any padding or marker bytes between the image and the video.
 		if end := findJPEGEndBefore(data, b.videoStart); end != -1 {
@@ -60,7 +74,7 @@ func Split(data []byte) (Parts, error) {
 		}
 	}
 
-	return Parts{Photo: data[:b.photoEnd], Video: data[b.videoStart:], Method: b.method}, nil
+	return Parts{Photo: data[:b.photoEnd], Video: data[b.videoStart:videoEnd], Method: b.method}, nil
 }
 
 // boundary is an accepted split point. photoEnd <= videoStart; the bytes in
@@ -78,7 +92,7 @@ type splitter struct {
 }
 
 func (s *splitter) locate() (boundary, error) {
-	if videoLength, ok := findMotionPhotoVideoLength(s.data); ok {
+	for _, videoLength := range findMotionPhotoVideoLengths(s.data) {
 		start := len(s.data) - videoLength
 		if s.accept(start, MethodMetadata) {
 			return boundary{photoEnd: start, videoStart: start, method: MethodMetadata}, nil
@@ -90,7 +104,6 @@ func (s *splitter) locate() (boundary, error) {
 	}
 
 	if b, ok := s.findMarker(magicV2, MethodMPVD); ok {
-		b.photoEnd = boxStart(s.data, b.photoEnd)
 		return b, nil
 	}
 
@@ -128,12 +141,12 @@ func (s *splitter) findMarker(magic []byte, method Method) (boundary, bool) {
 	rejected := len(s.issues)
 
 	if b, ok := s.searchMarkerRegion(s.data[searchStart:], searchStart, magic, method); ok {
-		return b, true
+		return s.enclosing(b), true
 	}
 
 	if searchStart > 0 {
 		if b, ok := s.searchMarkerRegion(s.data[:searchStart+len(magic)-1], 0, magic, method); ok {
-			return b, true
+			return s.enclosing(b), true
 		}
 	}
 
@@ -153,7 +166,7 @@ func (s *splitter) searchMarkerRegion(region []byte, base int, magic []byte, met
 		}
 
 		markerStart := base + markerIndex
-		start := markerStart + len(magic)
+		start := payloadStart(s.data, markerStart, magic)
 		if s.accept(start, method) {
 			return boundary{photoEnd: markerStart, videoStart: start, method: method}, true
 		}
@@ -164,22 +177,90 @@ func (s *splitter) searchMarkerRegion(region []byte, base int, magic []byte, met
 	return boundary{}, false
 }
 
-// boxStart returns the offset of the ISO BMFF box whose type field begins at
-// typeStart, or typeStart itself when the preceding bytes are not a plausible
-// box size. HEIC motion photos carry the video inside an mpvd box, whose
-// header is not part of the image.
-func boxStart(data []byte, typeStart int) int {
-	if typeStart < 4 {
-		return typeStart
+// enclosing returns the boundary of the video that the one at b is part of,
+// or b if there is none. A video may hold a marker followed by an MP4 of its
+// own, in a free box for one, and the last marker is then not the video's.
+func (s *splitter) enclosing(b boundary) boundary {
+	found := b
+	for _, marker := range []struct {
+		magic  []byte
+		method Method
+	}{
+		{magicV1, MethodMotionPhotoData},
+		{magicV2, MethodMPVD},
+	} {
+		// Only a video that begins further up than the one found counts,
+		// and not what the metadata segments of a JPEG may hold.
+		head := s.data[:found.photoEnd]
+		for offset, _ := jpegScanStart(s.data); ; {
+			index := bytes.Index(head[min(offset, len(head)):], marker.magic)
+			if index == -1 {
+				break
+			}
+			markerStart := offset + index
+			start := payloadStart(s.data, markerStart, marker.magic)
+			offset = markerStart + 1
+
+			if start >= found.videoStart || !looksLikeMP4(s.data[start:]) {
+				continue
+			}
+			// It contains the one found if its boxes, the movie box among
+			// them, run past where that one begins.
+			if walk := walkMP4(s.data[start:]); !walk.moov || start+walk.length <= b.videoStart {
+				continue
+			}
+			if validateSplitCandidate(s.data, start) == nil {
+				found = boundary{photoEnd: markerStart, videoStart: start, method: marker.method}
+				break
+			}
+		}
+	}
+	return found
+}
+
+// payloadStart returns where the video that the marker at markerStart
+// announces begins: right after it, or after the 64-bit size that follows
+// the type of an mpvd box whose size field says so. That is only taken to be
+// the case if the size is one the box can have and a video does begin there.
+func payloadStart(data []byte, markerStart int, magic []byte) int {
+	start := markerStart + len(magic)
+	if !bytes.Equal(magic, magicV2) || markerStart < 4 || len(data)-start < 8 ||
+		binary.BigEndian.Uint32(data[markerStart-4:]) != 1 {
+		return start
 	}
 
-	start := typeStart - 4
-	size := uint64(binary.BigEndian.Uint32(data[start:typeStart]))
-	if size < 8 || size > uint64(len(data)-start) {
-		return typeStart
+	size := binary.BigEndian.Uint64(data[start:])
+	if size < 16 || size > uint64(len(data)-(markerStart-4)) || !looksLikeMP4(data[start+8:]) {
+		return start
+	}
+	return start + 8
+}
+
+// mpvdBox returns the extent of the mpvd box whose payload begins at
+// payloadStart. ok is false when the bytes before it are not the header of
+// such a box, or not one with a plausible size.
+func mpvdBox(data []byte, payloadStart int) (start, end int, ok bool) {
+	if payloadStart >= 8 && bytes.Equal(data[payloadStart-4:payloadStart], magicV2) {
+		start = payloadStart - 8
+		switch size := uint64(binary.BigEndian.Uint32(data[start:])); {
+		case size == 0: // the box runs to the end
+			return start, len(data), true
+		case size >= 8 && size <= uint64(len(data)-start):
+			return start, start + int(size), true
+		}
+		return 0, 0, false
 	}
 
-	return start
+	// A header whose size field is 1 is followed by the size in 64 bits.
+	if payloadStart >= 16 && bytes.Equal(data[payloadStart-12:payloadStart-8], magicV2) &&
+		binary.BigEndian.Uint32(data[payloadStart-16:]) == 1 {
+		start = payloadStart - 16
+		if size := binary.BigEndian.Uint64(data[payloadStart-8:]); size >= 16 && size <= uint64(len(data)-start) {
+			return start, start + int(size), true
+		}
+	}
+
+	return 0, 0, false
 }
 
 func validateSplitCandidate(data []byte, start int) error {

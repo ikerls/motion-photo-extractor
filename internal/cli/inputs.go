@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -46,6 +48,74 @@ func resolveInput(input string, skipDir func(dir string, err error)) (files []st
 
 	// Not found; let extraction report the error for this path.
 	return []string{input}, true, nil
+}
+
+// outputDirs returns the directories that the extraction of inputs writes
+// to: outputDir or, without one, the directory of each file that inputs
+// designate. These are found without looking for the files themselves, of
+// which an interrupted run may have left none. Directories that do not exist
+// are left out.
+func outputDirs(outputDir string, inputs []string) []string {
+	var dirs []string
+	seen := make(map[string]bool)
+	add := func(dir string) {
+		info, err := os.Stat(dir)
+		// One that cannot be looked at is kept, to be reported when read.
+		if errors.Is(err, fs.ErrNotExist) || (err == nil && !info.IsDir()) {
+			return
+		}
+		key := pathKey(dir)
+		if resolved, err := filepath.EvalSymlinks(key); err == nil {
+			key = resolved
+		}
+		if !seen[key] {
+			seen[key] = true
+			dirs = append(dirs, dir)
+		}
+	}
+
+	if outputDir != "" {
+		add(outputDir)
+		return dirs
+	}
+
+	for _, input := range inputs {
+		info, err := os.Stat(input)
+		_, isRegex := regexInput(input)
+		switch {
+		case err == nil && info.IsDir():
+			walkDirs(input, add)
+		case err == nil:
+			add(filepath.Dir(input))
+		case isRegex:
+			add(".")
+		case containsGlob(input):
+			// The directories a pattern designates do not depend on which
+			// files it matches in them.
+			parents := []string{filepath.Dir(input)}
+			if containsGlob(parents[0]) {
+				parents, _ = filepath.Glob(parents[0])
+			}
+			for _, parent := range parents {
+				add(parent)
+			}
+		default:
+			add(filepath.Dir(input))
+		}
+	}
+	return dirs
+}
+
+// walkDirs calls visit for dir and the directories below it, the same ones
+// that supportedFilesIn searches.
+func walkDirs(dir string, visit func(dir string)) {
+	visit(dir)
+	entries, _ := os.ReadDir(dir)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			walkDirs(filepath.Join(dir, entry.Name()), visit)
+		}
+	}
 }
 
 // supportedFilesIn returns the supported files in dir and below, in lexical
@@ -99,10 +169,13 @@ func keepSupportedFiles(paths []string) []string {
 	return files
 }
 
-// regexInput returns the expression inside a /regex/ argument.
+// regexInput returns the expression inside a /regex/ argument. One with a
+// slash inside is a path instead, of a directory that does not exist: a file
+// name has no slash to match.
 func regexInput(input string) (string, bool) {
 	if len(input) >= 2 && strings.HasPrefix(input, "/") && strings.HasSuffix(input, "/") {
-		return input[1 : len(input)-1], true
+		expr := input[1 : len(input)-1]
+		return expr, !strings.Contains(expr, "/")
 	}
 	return "", false
 }

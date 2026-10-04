@@ -37,7 +37,7 @@ Extract video and image components from motion photo files (`.jpg`, `.jpeg`, `.h
 
 ### Input Options
 
-`<path>...` / `-i`, `--input <path>`: Motion photo files, directories or patterns. `--input` adds one more to those given as arguments.
+`<path>...` / `-i`, `--input <path>`: Motion photo files, directories or patterns. `--input` adds one more to those given as arguments and may be repeated.
 
 | Input | Example |
 | --- | --- |
@@ -64,12 +64,32 @@ A directory that cannot be read is reported and left out; the rest of the run go
 | `--extract-photo` | Extract photo component (default: true) |
 | `--extract-video` | Extract video component (default: true) |
 | `-f`, `--force` | Overwrite existing output files |
+| `--recover` | Clean up what an interrupted run left in the output directory |
 
-Existing output files are kept and reported unless `--force` is given. When one is kept, `--delete-orig` leaves the original in place.
+Existing output files are kept and reported unless `--force` is given. When one is kept, `--delete-orig` leaves the original in place. `--force` never replaces another motion photo of the same run: the file whose output would do so is reported as failed.
 
-With `--rename-orig`, an original on another filesystem than the output directory is copied there and then removed. If it cannot be removed, the extracted files and the copy are kept and the file is reported as failed.
+If a file cannot be extracted, everything is left as it was, including the outputs that `--force` would have replaced.
+
+With `--rename-orig`, an original on another filesystem than the output directory is copied there and then removed. If it cannot be removed, the extracted files and the copy are kept and the file is reported as failed. Originals that an earlier run moved aside are skipped, so a directory can be extracted again.
 
 Files with the same name in different directories would share their outputs in one output directory. Only the first is extracted; the others are reported as failed and left untouched.
+
+### Interrupted runs
+
+Ctrl+C, `kill` and closing the terminal stop a run after the file being processed, which leaves nothing behind. A run that is killed outright (`kill -9`, a crash) may leave the files it was working with next to its outputs: `IMG_video.mp4.1a2b3c4d.part` for an output that was being written, and `IMG.jpg.1a2b3c4d.bak` for a file that was moved out of an output's way, which may be an earlier output or the original itself.
+
+The next run lists such files in its output directory and changes nothing. `--recover` cleans them up before extracting, and can be given without any input:
+
+| Leftover | With `--recover` |
+| --- | --- |
+| `.part` file | Removed |
+| `.bak` file whose output is missing | Renamed back, if it is the only one for that output and not empty |
+| Any other `.bak` file | Kept and reported with the reason, to be looked at |
+
+Only files in the output directory with exactly these names are touched, whoever made them. A file named `motion-photo.1a2b3c4d.part` or `.bak`, used for outputs with very long names, is reported and kept. If the original had already been moved to `IMG_original.jpg`, it is left there and reported: rename it back to extract it again.
+
+> [!WARNING]
+> Do not use `--recover` while another run is writing to the same directory: its working files would be taken for leftovers. Recovery is best effort after a killed process and makes no promise after a power loss.
 
 ### Logging Options
 
@@ -116,7 +136,7 @@ $ go-motion-photo ./photos -o ./extracted
 | --- | --- |
 | `0` | Every file was extracted or skipped |
 | `1` | Invalid usage, at least one file failed, or a directory could not be read |
-| `130` | Interrupted with Ctrl+C; the file being processed is finished first |
+| `130` | Interrupted with Ctrl+C, `kill` or by closing the terminal; the file being processed is finished first |
 
 ## Configuration
 
@@ -130,7 +150,7 @@ Default config locations:
 - `$HOME/.config/go-motion-photo`
 
 > [!NOTE]
-> Only YAML and JSON are read. A config file in another format (such as `go-motion-photo.toml`) is rejected when passed to `--config`, and reported and ignored in the default locations.
+> Only YAML and JSON are read. A config file in another format (such as `go-motion-photo.toml`) is rejected when passed to `--config`, and reported and ignored in the default locations. A key that is not a config key, such as a misspelled one, is an error.
 
 ## Usage Examples
 
@@ -219,8 +239,10 @@ if err != nil {
 	return err
 }
 extractor.SanitizePhoto(parts.Photo) // stop the photo from advertising a video
-// parts.Photo and parts.Video are slices of data
+// parts.Photo and parts.Video are slices of data, without what lies between or after them
 ```
+
+After a process was killed during `ExtractFile`, `extractor.FindLeftovers(dir)` lists the working files it left in an output directory and `extractor.Recover(dir)` cleans them up as `--recover` does. `ExtractFile` never does so by itself.
 
 > [!IMPORTANT]
 > This tool is specifically designed for Samsung Motion Photos and may not work with motion photo formats from other manufacturers.

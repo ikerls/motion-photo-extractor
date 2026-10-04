@@ -37,6 +37,7 @@ type reporter struct {
 	unchanged   int // every output already existed
 	notMotion   int
 	unsupported int // files in a batch whose extension is not supported
+	moved       int // originals that an earlier run moved aside
 	failed      int
 	unreadable  int // directories whose files were left out
 
@@ -60,6 +61,48 @@ func (r *reporter) usingConfig(path string) {
 func (r *reporter) ignoredConfig(path string) {
 	r.log.Warn("Config file ignored, only YAML and JSON are supported", "path", path)
 	r.out.event(slog.LevelWarn, r.out.warn.Render(symbolWarn), path, "config file ignored, only YAML and JSON are supported")
+}
+
+// leftovers points out what an interrupted run left behind in dir.
+func (r *reporter) leftovers(dir string, found []extractor.Leftover) {
+	lines := []string{fmt.Sprintf("%s %s  %s", r.out.warn.Render(symbolWarn), dir,
+		plural(len(found), "leftover")+" of an interrupted run, clean up with --recover")}
+	for _, leftover := range found {
+		r.log.Warn("Leftover of an interrupted run, clean up with --recover", "path", leftover.Path, "kind", string(leftover.Kind))
+		lines = append(lines, "    "+r.out.dim.Render(leftover.Path))
+	}
+	r.out.print(slog.LevelWarn, lines...)
+}
+
+// recovered reports what was done about the leftovers of a directory.
+func (r *reporter) recovered(report extractor.RecoveryReport) {
+	for _, path := range report.Removed {
+		r.log.Info("Removed leftover", "path", path)
+		r.out.event(slog.LevelInfo, r.out.ok.Render(symbolOK), path, r.out.dim.Render("removed"))
+	}
+	for _, restored := range report.Restored {
+		details := "restored from " + filepath.Base(restored.Backup)
+		if restored.BackupRemains {
+			details += ", which could not be removed"
+		}
+		r.log.Info("Restored from backup", "path", restored.Target, "backup", restored.Backup)
+		r.out.event(slog.LevelInfo, r.out.ok.Render(symbolOK), restored.Target, details)
+	}
+	for _, retained := range report.Retained {
+		r.log.Warn("Leftover kept", "path", retained.Path, "reason", retained.Reason)
+		r.out.event(slog.LevelWarn, r.out.warn.Render(symbolWarn), retained.Path, "kept: "+retained.Reason)
+	}
+	for _, moved := range report.MovedAside {
+		r.log.Warn("Original moved aside by an interrupted run", "path", moved.Original, "rename_to", moved.Input)
+		r.out.event(slog.LevelWarn, r.out.warn.Render(symbolWarn), moved.Original,
+			"moved aside by an interrupted run; rename it to "+filepath.Base(moved.Input)+" to extract it")
+	}
+}
+
+// nothingToRecover reports that --recover found nothing to do in dirs.
+func (r *reporter) nothingToRecover(dirs []string) {
+	r.log.Info("No leftovers of an interrupted run", "dirs", strings.Join(dirs, ", "))
+	r.out.event(slog.LevelInfo, r.out.dim.Render(symbolSkip), strings.Join(dirs, ", "), r.out.dim.Render("no leftovers of an interrupted run"))
 }
 
 func (r *reporter) scanning(input string) {
@@ -225,14 +268,18 @@ func (r *reporter) tree(heading string, details []detail) []string {
 	return lines
 }
 
-// skippedFile reports a file of a batch left alone because it is not a
-// motion photo or not of a supported type.
+// skippedFile reports a file left alone because it is not a motion photo,
+// not of a supported type or was extracted by an earlier run.
 func (r *reporter) skippedFile(file string, reason error) {
 	message := "Skipped, not a motion photo"
-	if errors.Is(reason, extractor.ErrUnsupportedExtension) {
+	switch {
+	case errors.Is(reason, extractor.ErrUnsupportedExtension):
 		r.unsupported++
 		message = "Skipped, unsupported file extension"
-	} else {
+	case errors.Is(reason, errAlreadyExtracted):
+		r.moved++
+		message = "Skipped, already extracted"
+	default:
 		r.notMotion++
 	}
 
@@ -271,7 +318,7 @@ func (r *reporter) finish(outputDir string, elapsed time.Duration, interrupted b
 		return
 	}
 
-	notExtractable := r.notMotion + r.unsupported
+	notExtractable := r.notMotion + r.unsupported + r.moved
 	processed := r.extracted + r.unchanged + notExtractable + r.failed
 	skipped := r.unchanged + notExtractable
 	if interrupted {
@@ -328,6 +375,9 @@ func (r *reporter) finish(outputDir string, elapsed time.Duration, interrupted b
 		}
 		if r.unsupported > 0 {
 			reasons = append(reasons, plural(r.unsupported, "file")+" of an unsupported type")
+		}
+		if r.moved > 0 {
+			reasons = append(reasons, plural(r.moved, "original")+" of an earlier extraction")
 		}
 		if len(reasons) > 0 && !r.out.enabled(slog.LevelDebug) {
 			lines = append(lines, "  "+r.out.dim.Render(strings.Join(reasons, " and ")+" skipped, list them with --verbose"))
