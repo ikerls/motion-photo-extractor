@@ -78,18 +78,18 @@ Files with the same name in different directories would share their outputs in o
 
 Ctrl+C, `kill` and closing the terminal stop a run after the file being processed, which leaves nothing behind. A run that is killed outright (`kill -9`, a crash) may leave the files it was working with next to its outputs: `IMG_video.mp4.1a2b3c4d.part` for an output that was being written, and `IMG.jpg.1a2b3c4d.bak` for a file that was moved out of an output's way, which may be an earlier output or the original itself.
 
-The next run lists such files in its output directory and changes nothing. `--recover` cleans them up before extracting, and can be given without any input:
+The next run lists such files in its output directory and changes nothing. `--recover` cleans them up before extracting, and can be given without any input. With `--output ""`, where files are extracted next to the originals, the directories looked at are those of the inputs, including every directory below one that is given.
 
 | Leftover | With `--recover` |
 | --- | --- |
-| `.part` file | Removed |
-| `.bak` file whose output is missing | Renamed back, if it is the only one for that output and not empty |
-| Any other `.bak` file | Kept and reported with the reason, to be looked at |
+| `.part` file | Removed, if it is a regular file |
+| `.bak` file whose output is missing | Put back, if it is the only one for that output and a regular file that is not empty |
+| Anything else | Kept and reported with the reason, to be looked at |
 
 Only files in the output directory with exactly these names are touched, whoever made them. A file named `motion-photo.1a2b3c4d.part` or `.bak`, used for outputs with very long names, is reported and kept. If the original had already been moved to `IMG_original.jpg`, it is left there and reported: rename it back to extract it again.
 
 > [!WARNING]
-> Do not use `--recover` while another run is writing to the same directory: its working files would be taken for leftovers. Recovery is best effort after a killed process and makes no promise after a power loss.
+> Do not use `--recover` while another run is writing to the same directory: its working files would be taken for leftovers. Recovery is best effort after a killed process. It makes no promise after a power loss: files are not synced to disk in the order they are written and moved, so what is found afterwards may be incomplete.
 
 ### Logging Options
 

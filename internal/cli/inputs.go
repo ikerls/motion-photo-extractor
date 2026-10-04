@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
+	"syscall"
 
 	"github.com/ikerls/motion-photo-extractor/pkg/extractor"
 )
@@ -55,13 +57,21 @@ func resolveInput(input string, skipDir func(dir string, err error)) (files []st
 // designate. These are found without looking for the files themselves, of
 // which an interrupted run may have left none. Directories that do not exist
 // are left out.
-func outputDirs(outputDir string, inputs []string) []string {
-	var dirs []string
-	seen := make(map[string]bool)
+//
+// The error tells where the looking failed. The directories that were found
+// all the same are returned along with it.
+func outputDirs(outputDir string, inputs []string) ([]string, error) {
+	var (
+		dirs []string
+		errs []error
+		seen = make(map[string]bool)
+	)
 	add := func(dir string) {
-		info, err := os.Stat(dir)
+		// Files are written to the path as cleaned, wherever a link in it
+		// followed by .. would lead.
+		dir = filepath.Clean(dir)
 		// One that cannot be looked at is kept, to be reported when read.
-		if errors.Is(err, fs.ErrNotExist) || (err == nil && !info.IsDir()) {
+		if !mayBeDir(dir) {
 			return
 		}
 		key := pathKey(dir)
@@ -74,9 +84,30 @@ func outputDirs(outputDir string, inputs []string) []string {
 		}
 	}
 
+	// addAsWritten adds a directory that an input designates if it is one as
+	// it is written. A path such as missing/.. leads nowhere, whatever
+	// cleaning makes of it, and no file is found through it. Nor is one
+	// through a path that cannot be followed, which is an error.
+	addAsWritten := func(dir string) {
+		info, err := os.Stat(dir)
+		switch {
+		case errors.Is(err, fs.ErrNotExist), errors.Is(err, syscall.ENOTDIR):
+		case err != nil:
+			errs = append(errs, err)
+		case info.IsDir():
+			add(dir)
+		}
+	}
+
 	if outputDir != "" {
+		// What is there in place of the directory is not one to skip. The
+		// path is the one files are written to, as below.
+		outputDir = filepath.Clean(outputDir)
+		if info, err := os.Stat(outputDir); err == nil && !info.IsDir() {
+			return nil, fmt.Errorf("%s is not a directory", outputDir)
+		}
 		add(outputDir)
-		return dirs
+		return dirs, nil
 	}
 
 	for _, input := range inputs {
@@ -84,6 +115,8 @@ func outputDirs(outputDir string, inputs []string) []string {
 		_, isRegex := regexInput(input)
 		switch {
 		case err == nil && info.IsDir():
+			// As written, like the search for its files: the directories
+			// below it are those of where the path leads.
 			walkDirs(input, add)
 		case err == nil:
 			add(filepath.Dir(input))
@@ -92,18 +125,36 @@ func outputDirs(outputDir string, inputs []string) []string {
 		case containsGlob(input):
 			// The directories a pattern designates do not depend on which
 			// files it matches in them.
-			parents := []string{filepath.Dir(input)}
-			if containsGlob(parents[0]) {
-				parents, _ = filepath.Glob(parents[0])
+			parents, err := globDirs(input)
+			if err != nil {
+				errs = append(errs, err)
 			}
 			for _, parent := range parents {
-				add(parent)
+				addAsWritten(parent)
 			}
 		default:
-			add(filepath.Dir(input))
+			// A file that is not there may have been, in a directory that is.
+			_, parent := cleanGlobDir(dirPart(input))
+			addAsWritten(parent)
 		}
 	}
-	return dirs
+	return dirs, errors.Join(errs...)
+}
+
+// mayBeDir reports whether path is a directory, or cannot be looked at to
+// tell. It is not one if there is nothing at path, or a file at or above it.
+func mayBeDir(path string) bool {
+	info, err := os.Stat(path)
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		return false
+	}
+	return err != nil || info.IsDir()
+}
+
+// dirPart returns the part of path that names its directory, as written.
+func dirPart(path string) string {
+	dir, _ := filepath.Split(path)
+	return dir
 }
 
 // walkDirs calls visit for dir and the directories below it, the same ones
@@ -116,6 +167,90 @@ func walkDirs(dir string, visit func(dir string)) {
 			walkDirs(filepath.Join(dir, entry.Name()), visit)
 		}
 	}
+}
+
+// globDirs returns the directories in which filepath.Glob looks for the
+// files that pattern matches. They are found by Glob itself, so that they
+// are the same in every case. Unlike Glob, globDirs tells of a directory
+// that could not be read, in which more of them may be. What was found is
+// returned along with the error.
+func globDirs(pattern string) ([]string, error) {
+	// A pattern that Glob turns down designates nothing. Glob is asked
+	// itself: it finds some mistakes only when it comes to match a name.
+	if _, err := filepath.Glob(pattern); err != nil {
+		return nil, fmt.Errorf("invalid glob pattern %q: %w", pattern, err)
+	}
+
+	prefix, dir := cleanGlobDir(dirPart(pattern))
+	if !hasGlobMeta(dir[prefix:]) {
+		return []string{dir}, nil
+	}
+	matches, err := filepath.Glob(dir)
+	if err != nil {
+		return nil, fmt.Errorf("invalid glob pattern %q: %w", pattern, err)
+	}
+	return matches, hiddenGlobErrors(dir)
+}
+
+// hiddenGlobErrors returns what kept filepath.Glob(pattern) from reading a
+// directory it looked for matches in, which it says nothing about. The
+// pattern is taken apart the way Glob does.
+func hiddenGlobErrors(pattern string) error {
+	prefix, dir := cleanGlobDir(dirPart(pattern))
+
+	var errs []error
+	parents := []string{dir}
+	if hasGlobMeta(dir[prefix:]) {
+		if dir == pattern {
+			return nil
+		}
+		errs = append(errs, hiddenGlobErrors(dir))
+		parents, _ = filepath.Glob(dir)
+	}
+
+	for _, parent := range parents {
+		// What is not a directory holds nothing that could match.
+		if !mayBeDir(parent) {
+			continue
+		}
+		file, err := os.Open(parent)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		file.Close()
+	}
+	return errors.Join(errs...)
+}
+
+// cleanGlobDir prepares the directory part of a pattern, as filepath.Split
+// returns it, the way filepath.Glob does: but for a root, the separator it
+// ends with is dropped, and nothing else about it is changed. prefix is the
+// length of what begins it and is no pattern, whatever it is made of: the
+// name of a Windows volume, such as \\?\C:.
+func cleanGlobDir(dir string) (prefix int, cleaned string) {
+	volume := len(filepath.VolumeName(dir))
+	switch {
+	case dir == "":
+		return 0, "."
+	case volume+1 == len(dir) && os.IsPathSeparator(dir[len(dir)-1]):
+		return volume + 1, dir // a root
+	case volume == len(dir) && len(dir) == 2:
+		return volume, dir + "." // a drive, as in C:
+	default:
+		return min(volume, len(dir)-1), dir[:len(dir)-1]
+	}
+}
+
+// hasGlobMeta reports whether path is more than a literal name to a glob
+// pattern: besides the characters that match several names, a backslash
+// stands for the character after it, except on Windows where it separates
+// directories.
+func hasGlobMeta(path string) bool {
+	if runtime.GOOS != "windows" && strings.Contains(path, `\`) {
+		return true
+	}
+	return containsGlob(path)
 }
 
 // supportedFilesIn returns the supported files in dir and below, in lexical

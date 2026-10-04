@@ -285,7 +285,7 @@ func process(ctx context.Context, cfg *config.Config, rep *reporter) error {
 // only pointed out without. An error stops the run before it extracts
 // anything.
 func checkLeftovers(cfg *config.Config, rep *reporter) error {
-	dirs := outputDirs(cfg.OutputDir, cfg.Inputs)
+	dirs, err := outputDirs(cfg.OutputDir, cfg.Inputs)
 
 	if !cfg.Recover {
 		for _, dir := range dirs {
@@ -298,14 +298,23 @@ func checkLeftovers(cfg *config.Config, rep *reporter) error {
 		return nil
 	}
 
+	// Every directory is recovered as far as possible, whatever went wrong
+	// with another one.
+	var errs []error
+	if err != nil {
+		errs = append(errs, fmt.Errorf("recover: %w", err))
+	}
 	nothing := true
 	for _, dir := range dirs {
 		report, err := extractor.Recover(dir)
 		rep.recovered(report)
 		if err != nil {
-			return fmt.Errorf("recover %s: %w", dir, err)
+			errs = append(errs, fmt.Errorf("recover %s: %w", dir, err))
 		}
 		nothing = nothing && report.Empty()
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 	if nothing && len(dirs) > 0 {
 		rep.nothingToRecover(dirs)

@@ -67,10 +67,12 @@ func (r *reporter) ignoredConfig(path string) {
 func (r *reporter) leftovers(dir string, found []extractor.Leftover) {
 	lines := []string{fmt.Sprintf("%s %s  %s", r.out.warn.Render(symbolWarn), dir,
 		plural(len(found), "leftover")+" of an interrupted run, clean up with --recover")}
-	for _, leftover := range found {
-		r.log.Warn("Leftover of an interrupted run, clean up with --recover", "path", leftover.Path, "kind", string(leftover.Kind))
+	names := make([]string, len(found))
+	for i, leftover := range found {
+		names[i] = filepath.Base(leftover.Path)
 		lines = append(lines, "    "+r.out.dim.Render(leftover.Path))
 	}
+	r.log.Warn("Leftovers of an interrupted run, clean up with --recover", "dir", dir, "files", strings.Join(names, " "))
 	r.out.print(slog.LevelWarn, lines...)
 }
 

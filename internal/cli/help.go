@@ -45,7 +45,13 @@ var helpSections = []helpSection{
 			{"    --delete-orig", "Delete the original after a successful extraction"},
 			{"    --extract-photo", "Extract the photo component (default: true)"},
 			{"    --extract-video", "Extract the video component (default: true)"},
-			{"    --recover", "Clean up the .part and .bak files that a run which was\nkilled left in the output directory. Not while another\nrun is writing to that directory"},
+			{"    --recover", "Clean up what a run that was killed left in the output\ndirectory, before extracting. Needs no input"},
+		},
+		notes: []string{
+			"A run that is killed outright may leave files named <output>.<8 hex digits>.part",
+			"and .bak, which the next run points out. --recover removes the .part files and",
+			"puts a .bak file back if its output is missing and it is the only one for it;",
+			"any other is kept and reported. Not while another run writes to that directory.",
 		},
 	},
 	{

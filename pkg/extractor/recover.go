@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 )
 
 // The files ExtractFile works with next to its outputs are named after them:
@@ -73,6 +74,11 @@ type Leftover struct {
 // A name is all there is to go by, so a file of that name that comes from
 // somewhere else is returned just the same.
 func FindLeftovers(dir string) ([]Leftover, error) {
+	// The directory is read under the name that its files are then reached
+	// by, which is also the one ExtractFile writes to. Left as given, a path
+	// such as link/.. would be listed where the link leads and its files
+	// looked for next to the link.
+	dir = filepath.Clean(dir)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
@@ -136,8 +142,8 @@ func parseLeftoverName(name string) (target string, kind LeftoverKind, ok bool) 
 	if target == fallbackName {
 		return "", kind, true
 	}
-	ext := filepath.Ext(target)
-	if ext == target || (!SupportedExtension(target) && !strings.EqualFold(ext, videoExtension)) {
+	// A file may be called .jpg, and its outputs then .jpg and .mp4.
+	if !SupportedExtension(target) && !strings.EqualFold(filepath.Ext(target), videoExtension) {
 		return "", "", false
 	}
 	return target, kind, true
@@ -218,7 +224,7 @@ func Recover(dir string) (RecoveryReport, error) {
 	backups := make(map[string]int)
 	for _, leftover := range found {
 		if leftover.Kind == LeftoverBackup && leftover.Target != "" {
-			backups[strings.ToLower(leftover.Target)]++
+			backups[foldCase(leftover.Target)]++
 		}
 	}
 
@@ -263,7 +269,7 @@ func Recover(dir string) (RecoveryReport, error) {
 		case leftover.TargetState != TargetMissing:
 			retain("cannot tell whether %s exists: %v", target, reason(leftover.TargetErr))
 
-		case backups[strings.ToLower(leftover.Target)] > 1:
+		case backups[foldCase(leftover.Target)] > 1:
 			retain("one of several backups of %s; look at them and rename the right one by hand", target)
 
 		case !leftover.info.Mode().IsRegular():
@@ -289,6 +295,19 @@ func Recover(dir string) (RecoveryReport, error) {
 	}
 
 	return report, errors.Join(errs...)
+}
+
+// foldCase returns a string that is the same for every name that differs
+// from name only in case, as strings.EqualFold tells: each letter is replaced
+// by the first of those it is folded with.
+func foldCase(name string) string {
+	return strings.Map(func(r rune) rune {
+		first := r
+		for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
+			first = min(first, folded)
+		}
+		return first
+	}, name)
 }
 
 // movedOriginal reports whether the staged file leftover was to take the

@@ -26,6 +26,9 @@ func TestParseLeftoverName(t *testing.T) {
 		{name: "IMG_original.jpg.deadbeef.part", target: "IMG_original.jpg", kind: LeftoverStaged, ok: true},
 		{name: "motion-photo.deadbeef.part", kind: LeftoverStaged, ok: true},
 		{name: "motion-photo.deadbeef.bak", kind: LeftoverBackup, ok: true},
+		// A file may be called .jpg, and its outputs then .jpg and .mp4.
+		{name: ".jpg.deadbeef.bak", target: ".jpg", kind: LeftoverBackup, ok: true},
+		{name: ".mp4.deadbeef.part", target: ".mp4", kind: LeftoverStaged, ok: true},
 
 		// Other files, however much they look like one.
 		{name: "notes.txt.deadbeef.part"},
@@ -36,7 +39,6 @@ func TestParseLeftoverName(t *testing.T) {
 		{name: "IMG.jpg.part"},
 		{name: "IMG.jpg.deadbeef.tmp"},
 		{name: "IMG.jpg.deadbeef"},
-		{name: ".jpg.deadbeef.part"},
 		{name: "deadbeef.part"},
 		{name: "IMG.jpg"},
 	}
@@ -210,6 +212,38 @@ func TestRecoverRetainsBackupsThatAreNotPlainlyTheOnlyCopy(t *testing.T) {
 			kept:   []string{"IMG.jpg.11111111.bak", "img.jpg.22222222.bak"},
 		},
 		{
+			// A filesystem that takes no account of case does so for more
+			// than the letters of English.
+			name:  "backups of names that differ in the case of a Greek letter",
+			files: map[string]string{"Σ.jpg.11111111.bak": "one", "σ.jpg.22222222.bak": "two", "ς.jpg.33333333.bak": "three"},
+			setup: func(t *testing.T, dir string) {
+				if len(dirEntries(t, dir)) != 3 {
+					t.Skip("needs a filesystem that tells names apart by case")
+				}
+			},
+			reason: "one of several backups of",
+			kept:   []string{"Σ.jpg.11111111.bak", "ς.jpg.33333333.bak", "σ.jpg.22222222.bak"},
+		},
+		{
+			// A backup that would not be put back still makes the others
+			// ones to choose from.
+			name:   "several backups of which one is empty",
+			files:  map[string]string{"IMG.jpg.11111111.bak": "", "IMG.jpg.22222222.bak": "original"},
+			reason: "one of several backups of IMG.jpg",
+			kept:   []string{"IMG.jpg.11111111.bak", "IMG.jpg.22222222.bak"},
+		},
+		{
+			name:  "several backups of which one is a link",
+			files: map[string]string{"IMG.jpg.22222222.bak": "original", "elsewhere.jpg": "other"},
+			setup: func(t *testing.T, dir string) {
+				if err := os.Symlink("elsewhere.jpg", filepath.Join(dir, "IMG.jpg.11111111.bak")); err != nil {
+					t.Skipf("cannot create symlinks: %v", err)
+				}
+			},
+			reason: "one of several backups of IMG.jpg",
+			kept:   []string{"IMG.jpg.11111111.bak", "IMG.jpg.22222222.bak"},
+		},
+		{
 			// What a run leaves that was killed between reserving the name
 			// of a backup and moving the file to it, and what a later run
 			// that moved the original aside must not find to restore.
@@ -289,6 +323,68 @@ func TestRecoverRetainsStagedFilesThatAreNotRegular(t *testing.T) {
 		t.Fatalf("Retained = %q, Removed = %q; want %q and none", got, report.Removed, want)
 	}
 	assertDirEntries(t, dir, "IMG.mp4.11111111.part", "IMG.mp4.22222222.part", "precious.mp4")
+}
+
+func TestFoldCase(t *testing.T) {
+	groups := [][]string{
+		{"IMG.jpg", "img.JPG", "Img.Jpg"},
+		{"Σ.jpg", "σ.jpg", "ς.jpg"},
+		{"K.jpg", "k.jpg", "\u212a.jpg"}, // the Kelvin sign
+	}
+	for _, group := range groups {
+		for _, name := range group {
+			if got, want := foldCase(name), foldCase(group[0]); got != want {
+				t.Errorf("foldCase(%q) = %q, want %q as for %q", name, got, want, group[0])
+			}
+		}
+	}
+	if foldCase("IMG.jpg") == foldCase("IMG.jpeg") {
+		t.Error("foldCase() is the same for names that differ by more than case")
+	}
+}
+
+// The files of a directory called .jpg and .mp4 are outputs like any other.
+func TestRecoverHandlesOutputsNamedByTheirExtensionAlone(t *testing.T) {
+	dir := t.TempDir()
+	writeFiles(t, dir, map[string]string{
+		".jpg.11111111.bak":  "original",
+		".jpg.22222222.part": "photo",
+		".mp4.33333333.part": "video",
+	})
+
+	report, err := Recover(dir)
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if len(report.Removed) != 2 || len(report.Restored) != 1 {
+		t.Fatalf("report = %+v, want two staged files removed and the backup restored", report)
+	}
+	assertDirEntries(t, dir, ".jpg")
+	assertFileContent(t, filepath.Join(dir, ".jpg"), []byte("original"))
+}
+
+// A link followed by .. is not where the link leads: files are written to
+// the path as cleaned, and that is the directory looked at.
+func TestFindLeftoversLooksWhereFilesAreWritten(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"work", "actual/child"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(root, "actual", "child"), filepath.Join(root, "work", "alias")); err != nil {
+		t.Skipf("cannot create symlinks: %v", err)
+	}
+	writeFiles(t, filepath.Join(root, "actual"), map[string]string{"elsewhere.mp4.11111111.part": "staged"})
+	writeFiles(t, filepath.Join(root, "work"), map[string]string{"here.mp4.22222222.part": "staged"})
+
+	found, err := FindLeftovers(filepath.Join(root, "work", "alias") + string(filepath.Separator) + "..")
+	if err != nil {
+		t.Fatalf("FindLeftovers() error = %v", err)
+	}
+	if len(found) != 1 || found[0].Path != filepath.Join(root, "work", "here.mp4.22222222.part") {
+		t.Fatalf("FindLeftovers() = %+v, want the staged file in work", found)
+	}
 }
 
 // A target that appears once it was found missing is not overwritten.
