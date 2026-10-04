@@ -57,6 +57,31 @@ func TestLoadCombinesInputFlagAndPositionalArgs(t *testing.T) {
 	}
 }
 
+func TestLoadKeepsEveryInputFlag(t *testing.T) {
+	cfg := loadConfigForTest(t, "-i", "a.jpg", "--input", "b.jpg", "c.jpg")
+
+	want := []string{"a.jpg", "b.jpg", "c.jpg"}
+	if !slices.Equal(cfg.Inputs, want) {
+		t.Fatalf("Inputs = %q, want %q", cfg.Inputs, want)
+	}
+}
+
+func TestLoadReadsInputFromEnvironment(t *testing.T) {
+	tempDir := t.TempDir()
+	writeConfig(t, tempDir, "input: from-config.jpg\n")
+	t.Setenv("GO_MOTION_PHOTO_INPUT", "from-env.jpg")
+
+	cfg := loadConfigForTestInDir(t, tempDir)
+	if want := []string{"from-env.jpg"}; !slices.Equal(cfg.Inputs, want) {
+		t.Fatalf("Inputs = %q, want %q", cfg.Inputs, want)
+	}
+
+	cfg = loadConfigForTestInDir(t, tempDir, "--input", "from-flag.jpg")
+	if want := []string{"from-flag.jpg"}; !slices.Equal(cfg.Inputs, want) {
+		t.Fatalf("Inputs = %q, want %q", cfg.Inputs, want)
+	}
+}
+
 func TestLoadPrefersPositionalArgOverConfigFileInput(t *testing.T) {
 	tempDir := t.TempDir()
 	writeConfig(t, tempDir, "input: from-config.jpg\n")

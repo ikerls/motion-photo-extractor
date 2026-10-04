@@ -38,13 +38,20 @@ var helpSections = []helpSection{
 	{
 		title: "Options",
 		rows: [][2]string{
-			{"-i, --input <path>", "Input to process, same as passing it as an argument"},
+			{"-i, --input <path>", "Input to process, same as passing it as an argument.\nMay be repeated"},
 			{"-o, --output <dir>", `Directory to save extracted files (default: ".")`},
 			{"-f, --force", "Overwrite existing output files"},
 			{"    --rename-orig", "Give extracted files the original's name and move the\noriginal to <name>_original, instead of adding suffixes"},
 			{"    --delete-orig", "Delete the original after a successful extraction"},
 			{"    --extract-photo", "Extract the photo component (default: true)"},
 			{"    --extract-video", "Extract the video component (default: true)"},
+			{"    --recover", "Clean up what a run that was killed left in the output\ndirectory, before extracting. Needs no input"},
+		},
+		notes: []string{
+			"A run that is killed outright may leave files named <output>.<8 hex digits>.part",
+			"and .bak, which the next run points out. --recover removes the .part files and",
+			"puts a .bak file back if its output is missing and it is the only one for it;",
+			"any other is kept and reported. Not while another run writes to that directory.",
 		},
 	},
 	{
@@ -79,7 +86,8 @@ var helpSections = []helpSection{
 		},
 		notes: []string{
 			"The exit status is 1 if any file failed or a directory could not be read,",
-			"and 130 if interrupted.",
+			"and 130 if interrupted with Ctrl+C, kill or by closing the terminal, which",
+			"stops the run after the file being processed.",
 		},
 	},
 }

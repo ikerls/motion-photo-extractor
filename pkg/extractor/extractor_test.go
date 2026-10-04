@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -363,8 +364,9 @@ func TestExtractFileRenameOriginalAcrossFilesystems(t *testing.T) {
 		assertDirEntries(t, f.output, "sample.jpg")
 	})
 
-	// A leftover staging file must not be written through: as a link to the
-	// input, that would empty the input before it is copied.
+	// A file that looks like a leftover staging file must not be written
+	// through: as a link to the input, that would empty the input before it
+	// is copied. It is not this call's to remove either.
 	t.Run("does not write through a leftover staging link", func(t *testing.T) {
 		f := setup(t)
 		if err := os.Symlink(f.input, filepath.Join(f.output, "sample_original.jpg.part")); err != nil {
@@ -376,7 +378,7 @@ func TestExtractFileRenameOriginalAcrossFilesystems(t *testing.T) {
 			t.Fatalf("ExtractFile() error = %v", err)
 		}
 		assertResult(t, res, moved(f))
-		assertDirEntries(t, f.output, "sample.jpg", "sample.mp4", "sample_original.jpg")
+		assertDirEntries(t, f.output, "sample.jpg", "sample.mp4", "sample_original.jpg", "sample_original.jpg.part")
 		assertFileContent(t, res.OriginalPath, f.original)
 	})
 
@@ -515,6 +517,247 @@ func TestExtractFileDeleteOriginalKeepsInputWhenOutputSkipped(t *testing.T) {
 		assertFileContent(t, want.OriginalPath, original)
 		assertFileContent(t, videoPath, []byte("existing"))
 	})
+}
+
+// Components are staged under names of their own: a file that happens to
+// have a staging name, or a link left under one, is neither written through
+// nor removed.
+func TestExtractFileDoesNotWriteThroughStagingNames(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "sample.jpg")
+	writeMotionPhotoFixture(t, input)
+	original, err := os.ReadFile(input)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	output := filepath.Join(tempDir, "out")
+	if err := os.Mkdir(output, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Symlink(input, filepath.Join(output, "sample_video.mp4.part")); err != nil {
+		t.Skipf("cannot create symlinks: %v", err)
+	}
+	other := filepath.Join(output, "sample_photo.jpg.part")
+	if err := os.WriteFile(other, []byte("someone's file"), 0644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	res, err := ExtractFile(input, Options{OutputDir: output})
+	if err != nil {
+		t.Fatalf("ExtractFile() error = %v", err)
+	}
+	assertFileContent(t, input, original)
+	assertFileContent(t, other, []byte("someone's file"))
+	assertFileContent(t, res.VideoPath, minimalMP4Data)
+	if info, err := os.Lstat(res.VideoPath); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("video = %v, err = %v, want a regular file", info, err)
+	}
+	assertDirEntries(t, output, "sample_photo.jpg", "sample_photo.jpg.part", "sample_video.mp4", "sample_video.mp4.part")
+}
+
+// A failed extraction takes back what it did, outputs that Overwrite
+// replaced included: these are put back, not removed.
+func TestExtractFileRestoresReplacedOutputsOnFailure(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "sample.jpg")
+	writeMotionPhotoFixture(t, input)
+	original, err := os.ReadFile(input)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	output := filepath.Join(tempDir, "out")
+	// A directory in the photo's place cannot be replaced by it.
+	if err := os.MkdirAll(filepath.Join(output, "sample_photo.jpg", "sub"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	video := filepath.Join(output, "sample_video.mp4")
+	if err := os.WriteFile(video, []byte("earlier video"), 0644); err != nil {
+		t.Fatalf("write earlier video: %v", err)
+	}
+
+	if _, err := ExtractFile(input, Options{OutputDir: output, Overwrite: true}); err == nil {
+		t.Fatal("ExtractFile() error = nil, want non-nil")
+	}
+	assertFileContent(t, input, original)
+	assertFileContent(t, video, []byte("earlier video"))
+	assertDirEntries(t, output, "sample_photo.jpg", "sample_video.mp4")
+}
+
+// An earlier original with the same content gives way to the input, and is
+// back in its place if the extraction fails after that.
+func TestExtractFileRestoresAnEarlierOriginalOnFailure(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "sample.jpg")
+	writeMotionPhotoFixture(t, input)
+	original, err := os.ReadFile(input)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	earlier := filepath.Join(tempDir, "sample_original.jpg")
+	if err := os.WriteFile(earlier, original, 0644); err != nil {
+		t.Fatalf("write earlier original: %v", err)
+	}
+	// A directory in the video's place cannot be replaced by it.
+	if err := os.Mkdir(filepath.Join(tempDir, "sample.mp4"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	if _, err := ExtractFile(input, Options{RenameOriginal: true, Overwrite: true}); err == nil {
+		t.Fatal("ExtractFile() error = nil, want non-nil")
+	}
+	assertDirEntries(t, tempDir, "sample.jpg", "sample.mp4", "sample_original.jpg")
+	assertFileContent(t, input, original)
+	assertFileContent(t, earlier, original)
+}
+
+func TestExtractFileReplacesOutputsWithOverwrite(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "sample.jpg")
+	writeMotionPhotoFixture(t, input)
+	for _, name := range []string{"sample_photo.jpg", "sample_video.mp4"} {
+		if err := os.WriteFile(filepath.Join(tempDir, name), []byte("earlier"), 0644); err != nil {
+			t.Fatalf("write earlier output: %v", err)
+		}
+	}
+
+	res, err := ExtractFile(input, Options{Overwrite: true})
+	if err != nil {
+		t.Fatalf("ExtractFile() error = %v", err)
+	}
+	assertFileContent(t, res.VideoPath, minimalMP4Data)
+	// Nothing of what was replaced is left behind.
+	assertDirEntries(t, tempDir, "sample.jpg", "sample_photo.jpg", "sample_video.mp4")
+}
+
+// An output that links to the input is replaced by the photo, which leaves
+// the input itself in place and still to be deleted.
+func TestExtractFileDeletesAnInputThatThePhotoOutputLinkedTo(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "in", "sample.jpg")
+	output := filepath.Join(tempDir, "out")
+	for _, dir := range []string{filepath.Dir(input), output} {
+		if err := os.Mkdir(dir, 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	writeMotionPhotoFixture(t, input)
+	if err := os.Symlink(input, filepath.Join(output, "sample.jpg")); err != nil {
+		t.Skipf("cannot create symlinks: %v", err)
+	}
+
+	res, err := ExtractFile(input, Options{OutputDir: output, RenameOriginal: true, DeleteOriginal: true})
+	if err != nil {
+		t.Fatalf("ExtractFile() error = %v", err)
+	}
+	assertResult(t, res, Result{
+		PhotoPath: filepath.Join(output, "sample.jpg"),
+		VideoPath: filepath.Join(output, "sample.mp4"),
+		Method:    MethodMetadata,
+	})
+	assertDirEntries(t, filepath.Dir(input))
+	assertDirEntries(t, output, "sample.jpg", "sample.mp4")
+	if info, err := os.Lstat(res.PhotoPath); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("photo = %v, err = %v, want a regular file", info, err)
+	}
+}
+
+// The input may be a link to the very file that the photo replaces. The
+// link is what was given to delete, and does not survive as one to the photo.
+func TestExtractFileDeletesAnInputThatLinksToThePhotoOutput(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "in", "sample.jpg")
+	output := filepath.Join(tempDir, "out")
+	for _, dir := range []string{filepath.Dir(input), output} {
+		if err := os.Mkdir(dir, 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	writeMotionPhotoFixture(t, filepath.Join(output, "sample.jpg"))
+	if err := os.Symlink(filepath.Join("..", "out", "sample.jpg"), input); err != nil {
+		t.Skipf("cannot create symlinks: %v", err)
+	}
+
+	res, err := ExtractFile(input, Options{OutputDir: output, RenameOriginal: true, DeleteOriginal: true})
+	if err != nil {
+		t.Fatalf("ExtractFile() error = %v", err)
+	}
+	if res.OriginalPath != "" {
+		t.Fatalf("OriginalPath = %q, want empty", res.OriginalPath)
+	}
+	assertDirEntries(t, filepath.Dir(input))
+	assertDirEntries(t, output, "sample.jpg", "sample.mp4")
+}
+
+// Staging adds to the name of an output, which may leave no room for it.
+func TestExtractFileStagesOutputsWithLongNames(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, strings.Repeat("a", 238)+".jpg")
+	_, data := buildMotionPhotoFixture(minimalMP4Data, len(minimalMP4Data), true)
+	if err := os.WriteFile(input, data, 0644); err != nil {
+		t.Skipf("cannot create a file with a long name: %v", err)
+	}
+
+	res, err := ExtractFile(input, Options{})
+	if err != nil {
+		t.Fatalf("ExtractFile() error = %v", err)
+	}
+	assertFileContent(t, res.VideoPath, minimalMP4Data)
+	if entries, err := os.ReadDir(tempDir); err != nil || len(entries) != 3 {
+		t.Fatalf("entries = %v, err = %v, want the input and its two outputs", entries, err)
+	}
+}
+
+// A link moved to another directory may no longer lead to its file. The
+// original that ends up there is the file's content instead.
+func TestExtractFileRenameOriginalCopiesTheFileBehindALink(t *testing.T) {
+	tempDir := t.TempDir()
+	source := filepath.Join(tempDir, "in", "source.jpg")
+	input := filepath.Join(tempDir, "in", "sample.jpg")
+	output := filepath.Join(tempDir, "out")
+	if err := os.Mkdir(filepath.Dir(input), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeMotionPhotoFixture(t, source)
+	original, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	if err := os.Symlink("source.jpg", input); err != nil {
+		t.Skipf("cannot create symlinks: %v", err)
+	}
+
+	res, err := ExtractFile(input, Options{OutputDir: output, RenameOriginal: true})
+	if err != nil {
+		t.Fatalf("ExtractFile() error = %v", err)
+	}
+	if info, err := os.Lstat(res.OriginalPath); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("original = %v, err = %v, want a regular file", info, err)
+	}
+	assertFileContent(t, res.OriginalPath, original)
+	assertFileContent(t, source, original)
+	assertDirEntries(t, filepath.Dir(input), "source.jpg")
+	assertDirEntries(t, output, "sample.jpg", "sample.mp4", "sample_original.jpg")
+
+	// In its own directory the link stays one, and still leads to its file.
+	if err := os.Symlink("source.jpg", input); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if res, err = ExtractFile(input, Options{RenameOriginal: true}); err != nil {
+		t.Fatalf("ExtractFile() in place error = %v", err)
+	}
+	if info, err := os.Lstat(res.OriginalPath); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("original = %v, err = %v, want a link", info, err)
+	}
+	assertFileContent(t, res.OriginalPath, original)
+}
+
+func TestExtractFileReportsAMissingFileWhateverItsExtension(t *testing.T) {
+	for _, name := range []string{"missing.jpg", "missing", "missing.png"} {
+		_, err := ExtractFile(filepath.Join(t.TempDir(), name), Options{})
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("ExtractFile(%s) error = %v, want os.ErrNotExist", name, err)
+		}
+	}
 }
 
 func TestTargets(t *testing.T) {

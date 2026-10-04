@@ -1,31 +1,56 @@
 package extractor
 
-import "bytes"
+import (
+	"bytes"
+	"encoding/binary"
+	"strings"
+)
 
 var (
 	xmpStartTag = []byte("<x:xmpmeta")
 	xmpEndTag   = []byte("</x:xmpmeta>")
 
-	motionPhotoSemantic = []byte(`Item:Semantic="MotionPhoto"`)
-	stillImageSemantic  = []byte(`Item:Semantic="Still_Image"`)
-	lengthAttrPrefix    = []byte(`Item:Length="`)
+	motionPhotoSemantics = bothQuotes(`Item:Semantic="MotionPhoto"`)
+	stillImageSemantics  = bothQuotes(`Item:Semantic="Still_Image"`)
+	lengthAttrPrefixes   = bothQuotes(`Item:Length="`)
 
-	motionPhotoEnabledAttrs = [][2][]byte{
-		{[]byte(`GCamera:MotionPhoto="1"`), []byte(`GCamera:MotionPhoto="0"`)},
-		{[]byte(`Camera:MotionPhoto="1"`), []byte(`Camera:MotionPhoto="0"`)},
-		{[]byte(`GCamera:MicroVideo="1"`), []byte(`GCamera:MicroVideo="0"`)},
-		{[]byte(`Camera:MicroVideo="1"`), []byte(`Camera:MicroVideo="0"`)},
-	}
+	motionPhotoEnabledAttrs = bothQuotes(
+		`GCamera:MotionPhoto="1"`,
+		`Camera:MotionPhoto="1"`,
+		`GCamera:MicroVideo="1"`,
+		`Camera:MicroVideo="1"`,
+	)
+	motionPhotoDisabledAttrs = bothQuotes(
+		`GCamera:MotionPhoto="0"`,
+		`Camera:MotionPhoto="0"`,
+		`GCamera:MicroVideo="0"`,
+		`Camera:MicroVideo="0"`,
+	)
 
-	motionPhotoOffsetPrefixes = [][]byte{
-		[]byte(`GCamera:MotionPhotoOffset="`),
-		[]byte(`Camera:MotionPhotoOffset="`),
-		[]byte(`GCamera:MicroVideoOffset="`),
-		[]byte(`Camera:MicroVideoOffset="`),
-	}
+	motionPhotoOffsetPrefixes = bothQuotes(
+		`GCamera:MotionPhotoOffset="`,
+		`Camera:MotionPhotoOffset="`,
+		`GCamera:MicroVideoOffset="`,
+		`Camera:MicroVideoOffset="`,
+	)
 )
 
+// xmpSearchLimit is how far into a JPEG the metadata is looked for when its
+// segments cannot be followed.
 const xmpSearchLimit = 512 << 10
+
+// bothQuotes returns attrs followed by the same attributes written with
+// single quotes, which XMP allows just as well and ExifTool writes.
+func bothQuotes(attrs ...string) [][]byte {
+	quoted := make([][]byte, 0, 2*len(attrs))
+	for _, attr := range attrs {
+		quoted = append(quoted, []byte(attr))
+	}
+	for _, attr := range attrs {
+		quoted = append(quoted, []byte(strings.ReplaceAll(attr, `"`, `'`)))
+	}
+	return quoted
+}
 
 // SanitizePhoto rewrites the XMP metadata of an extracted photo so it no
 // longer advertises an embedded video. Without this, the photo would still be
@@ -33,77 +58,133 @@ const xmpSearchLimit = 512 << 10
 //
 // The rewrite happens in place and never changes the length of photo.
 func SanitizePhoto(photo []byte) {
-	start, end, ok := findXMPBlock(headerSearchArea(photo))
+	for _, xmp := range findXMPBlocks(metadataArea(photo)) {
+		for i, enabled := range motionPhotoEnabledAttrs {
+			replaceAllSameLength(xmp, enabled, motionPhotoDisabledAttrs[i])
+		}
+		for i, semantic := range motionPhotoSemantics {
+			replaceAllSameLength(xmp, semantic, stillImageSemantics[i])
+		}
+		for _, prefix := range motionPhotoOffsetPrefixes {
+			zeroAttributeDigits(xmp, prefix)
+		}
+	}
+}
+
+// findMotionPhotoVideoLengths returns what the metadata of data gives as the
+// length of the video, most trusted first. There may be several: a file may
+// hold more than one XMP packet, and a packet both an item length and an
+// offset, of which any may be stale.
+func findMotionPhotoVideoLengths(data []byte) []int {
+	searchArea := metadataArea(data)
+
+	blocks := findXMPBlocks(searchArea)
+	if len(blocks) == 0 {
+		blocks = [][]byte{searchArea}
+	}
+
+	var lengths []int
+	for _, xmp := range blocks {
+		if length, ok := findMotionPhotoItemLength(xmp); ok {
+			lengths = append(lengths, length)
+		}
+		for _, prefix := range motionPhotoOffsetPrefixes {
+			if offset, ok := findIntAttribute(xmp, prefix); ok && offset > 0 {
+				lengths = append(lengths, offset)
+			}
+		}
+	}
+	return lengths
+}
+
+// metadataArea returns the part of data that may hold its XMP metadata. In a
+// JPEG that is the segments before the image data. Other formats, HEIC for
+// one, keep their metadata wherever they see fit.
+func metadataArea(data []byte) []byte {
+	if !bytes.HasPrefix(data, jpegSOI) {
+		return data
+	}
+
+	offset, ok := jpegScanStart(data)
 	if !ok {
-		return
+		offset = max(offset, xmpSearchLimit)
 	}
-
-	xmp := photo[start:end]
-	for _, replacement := range motionPhotoEnabledAttrs {
-		replaceAllSameLength(xmp, replacement[0], replacement[1])
-	}
-	replaceAllSameLength(xmp, motionPhotoSemantic, stillImageSemantic)
-	for _, prefix := range motionPhotoOffsetPrefixes {
-		zeroAttributeDigits(xmp, prefix)
-	}
+	return data[:min(len(data), offset)]
 }
 
-func findMotionPhotoVideoLength(data []byte) (int, bool) {
-	searchArea := headerSearchArea(data)
-	if start, end, ok := findXMPBlock(searchArea); ok {
-		searchArea = searchArea[start:end]
+// jpegScanStart returns where the image data of a JPEG begins, after the
+// segments that hold its metadata. ok is false if data is not a JPEG whose
+// segments can be followed that far; offset is then how far they could be.
+func jpegScanStart(data []byte) (offset int, ok bool) {
+	if !bytes.HasPrefix(data, jpegSOI) {
+		return 0, false
 	}
 
-	if length, ok := findMotionPhotoItemLength(searchArea); ok {
-		return length, true
+	offset = len(jpegSOI)
+	for len(data)-offset >= 4 && data[offset] == 0xFF {
+		switch marker := data[offset+1]; marker {
+		case 0xFF: // fill byte
+			offset++
+			continue
+		case 0xDA: // start of scan: the image data follows
+			return offset, true
+		}
+
+		// A segment that is not all there is not one to follow.
+		size := int(binary.BigEndian.Uint16(data[offset+2:]))
+		if size < 2 || size > len(data)-offset-2 {
+			break
+		}
+		offset += 2 + size
 	}
 
-	if offset, ok := findFirstIntAttribute(searchArea, motionPhotoOffsetPrefixes...); ok {
-		return offset, true
-	}
-
-	return 0, false
+	return offset, false
 }
 
-func headerSearchArea(data []byte) []byte {
-	return data[:min(len(data), xmpSearchLimit)]
-}
+// findXMPBlocks returns the XMP packets in data, in order.
+func findXMPBlocks(data []byte) [][]byte {
+	var blocks [][]byte
+	for {
+		start := bytes.Index(data, xmpStartTag)
+		if start == -1 {
+			return blocks
+		}
 
-func findXMPBlock(data []byte) (int, int, bool) {
-	start := bytes.Index(data, xmpStartTag)
-	if start == -1 {
-		return 0, 0, false
+		end := bytes.Index(data[start:], xmpEndTag)
+		if end == -1 {
+			return blocks
+		}
+		end += start + len(xmpEndTag)
+
+		blocks = append(blocks, data[start:end])
+		data = data[end:]
 	}
-
-	end := bytes.Index(data[start:], xmpEndTag)
-	if end == -1 {
-		return 0, 0, false
-	}
-
-	end += start + len(xmpEndTag)
-	return start, end, true
 }
 
 func findMotionPhotoItemLength(data []byte) (int, bool) {
-	searchStart := 0
-	for {
-		semanticIndex := bytes.Index(data[searchStart:], motionPhotoSemantic)
-		if semanticIndex == -1 {
-			return 0, false
-		}
-		semanticIndex += searchStart
-
-		tagStart := bytes.LastIndexByte(data[:semanticIndex], '<')
-		tagEnd := bytes.IndexByte(data[semanticIndex:], '>')
-		if tagStart != -1 && tagEnd != -1 {
-			tag := data[tagStart : semanticIndex+tagEnd+1]
-			if length, ok := findIntAttribute(tag, lengthAttrPrefix); ok && length > 0 {
-				return length, true
+	for _, semantic := range motionPhotoSemantics {
+		searchStart := 0
+		for {
+			semanticIndex := bytes.Index(data[searchStart:], semantic)
+			if semanticIndex == -1 {
+				break
 			}
-		}
+			semanticIndex += searchStart
 
-		searchStart = semanticIndex + len(motionPhotoSemantic)
+			tagStart := bytes.LastIndexByte(data[:semanticIndex], '<')
+			tagEnd := bytes.IndexByte(data[semanticIndex:], '>')
+			if tagStart != -1 && tagEnd != -1 {
+				tag := data[tagStart : semanticIndex+tagEnd+1]
+				if length, ok := findFirstIntAttribute(tag, lengthAttrPrefixes...); ok {
+					return length, true
+				}
+			}
+
+			searchStart = semanticIndex + len(semantic)
+		}
 	}
+
+	return 0, false
 }
 
 func findFirstIntAttribute(data []byte, prefixes ...[]byte) (int, bool) {
@@ -127,7 +208,8 @@ func findIntAttribute(data, prefix []byte) (int, bool) {
 		end++
 	}
 
-	if end == start || end >= len(data) || data[end] != '"' {
+	// The value ends with the quote that the prefix opened it with.
+	if end == start || end >= len(data) || data[end] != prefix[len(prefix)-1] {
 		return 0, false
 	}
 

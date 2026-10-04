@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -258,6 +259,163 @@ func TestProcessExtractsAFileNamedTwiceOnce(t *testing.T) {
 	assertFileExists(t, filepath.Join(output, "single_video.mp4"))
 }
 
+// With --rename-orig the originals stay next to what was extracted from
+// them. A second run must leave them alone instead of extracting them again.
+func TestProcessDoesNotExtractRenamedOriginalsAgain(t *testing.T) {
+	dir := t.TempDir()
+	writeMotionPhotoFixture(t, filepath.Join(dir, "IMG.jpg"))
+	// An original that nothing was extracted from is a file like any other.
+	writeMotionPhotoFixture(t, filepath.Join(dir, "other_original.jpg"))
+
+	cfg := testConfig(dir, dir)
+	cfg.RenameOrig = true
+	rep := discardReporter()
+	if err := process(t.Context(), cfg, rep); err != nil {
+		t.Fatalf("process() error = %v", err)
+	}
+	if rep.extracted != 2 {
+		t.Fatalf("extracted = %d, want 2", rep.extracted)
+	}
+	want := []string{
+		"IMG.jpg", "IMG.mp4", "IMG_original.jpg",
+		"other_original.jpg", "other_original.mp4", "other_original_original.jpg",
+	}
+	assertDirEntries(t, dir, want...)
+
+	for _, force := range []bool{false, true} {
+		cfg.Force = force
+		rep = discardReporter()
+		if err := process(t.Context(), cfg, rep); err != nil {
+			t.Fatalf("second process() error = %v", err)
+		}
+		if rep.extracted != 0 || rep.moved != 2 || rep.notMotion != 2 {
+			t.Fatalf("extracted = %d, moved = %d, notMotion = %d, want 0, 2 and 2", rep.extracted, rep.moved, rep.notMotion)
+		}
+		assertDirEntries(t, dir, want...)
+	}
+}
+
+// What tells of an earlier run is either component, whichever this run
+// extracts, and the directory however it is reached.
+func TestProcessRecognizesRenamedOriginalsOfADifferentRun(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	if err := os.Mkdir(real, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeMotionPhotoFixture(t, filepath.Join(real, "a.jpg"))
+
+	cfg := testConfig(real, real)
+	cfg.RenameOrig, cfg.ExtractPhoto = true, false
+	if err := process(t.Context(), cfg, discardReporter()); err != nil {
+		t.Fatalf("process() error = %v", err)
+	}
+	assertDirEntries(t, real, "a.mp4", "a_original.jpg")
+
+	// Only the video is there, and only the photo is asked for.
+	cfg.ExtractPhoto, cfg.ExtractVideo = true, false
+	rep := discardReporter()
+	if err := process(t.Context(), cfg, rep); err != nil {
+		t.Fatalf("second process() error = %v", err)
+	}
+	if rep.moved != 1 {
+		t.Fatalf("moved = %d, want 1", rep.moved)
+	}
+	assertDirEntries(t, real, "a.mp4", "a_original.jpg")
+
+	alias := filepath.Join(dir, "alias")
+	if err := os.Symlink(real, alias); err != nil {
+		t.Skipf("cannot create symlinks: %v", err)
+	}
+	cfg = testConfig(real, alias)
+	cfg.RenameOrig = true
+	rep = discardReporter()
+	if err := process(t.Context(), cfg, rep); err != nil {
+		t.Fatalf("process() through a link error = %v", err)
+	}
+	if rep.moved != 1 {
+		t.Fatalf("moved through a link = %d, want 1", rep.moved)
+	}
+	assertDirEntries(t, real, "a.mp4", "a_original.jpg")
+}
+
+// A motion photo of the run may also be reached through a link, which would
+// lead to the photo of another file once that replaced it.
+func TestProcessDoesNotOverwriteAnInputBehindALink(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "a.jpg")
+	target := filepath.Join(dir, "a_photo.jpg")
+	link := filepath.Join(dir, "b.jpg")
+	writeMotionPhotoFixture(t, first)
+	writeMotionPhotoFixture(t, target)
+	if err := os.Symlink("a_photo.jpg", link); err != nil {
+		t.Skipf("cannot create symlinks: %v", err)
+	}
+
+	cfg := testConfig(dir, first, link)
+	cfg.Force = true
+	rep := discardReporter()
+	if err := process(t.Context(), cfg, rep); err != errFilesFailed {
+		t.Fatalf("process() error = %v, want errFilesFailed", err)
+	}
+	if rep.extracted != 1 || rep.failed != 1 {
+		t.Fatalf("extracted = %d, failed = %d, want 1 and 1", rep.extracted, rep.failed)
+	}
+	assertFileContent(t, target, buildMotionPhotoFixture())
+	assertFileExists(t, filepath.Join(dir, "b_video.mp4"))
+}
+
+// With --force an output replaces what is there. That must not be another
+// motion photo of the run, which would be lost before it is extracted.
+func TestProcessDoesNotOverwriteAnotherInput(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "a.jpg")
+	second := filepath.Join(dir, "a_photo.jpg")
+	writeMotionPhotoFixture(t, first)
+	writeMotionPhotoFixture(t, second)
+
+	cfg := testConfig(dir, first, second)
+	cfg.Force = true
+	rep := discardReporter()
+	if err := process(t.Context(), cfg, rep); err != errFilesFailed {
+		t.Fatalf("process() error = %v, want errFilesFailed", err)
+	}
+	if rep.extracted != 1 || rep.failed != 1 {
+		t.Fatalf("extracted = %d, failed = %d, want 1 and 1", rep.extracted, rep.failed)
+	}
+	assertFileContent(t, first, buildMotionPhotoFixture())
+	assertFileContent(t, second, buildMotionPhotoFixture())
+	assertFileExists(t, filepath.Join(dir, "a_photo_video.mp4"))
+	assertFileDoesNotExist(t, filepath.Join(dir, "a_video.mp4"))
+}
+
+// The outputs of an earlier run are found along with their original when a
+// directory is extracted again. --force replaces them all the same.
+func TestProcessOverwritesEarlierOutputsFoundAsInputs(t *testing.T) {
+	dir := t.TempDir()
+	writeMotionPhotoFixture(t, filepath.Join(dir, "a.jpg"))
+
+	cfg := testConfig(dir, dir)
+	if err := process(t.Context(), cfg, discardReporter()); err != nil {
+		t.Fatalf("process() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a_video.mp4"), []byte("stale"), 0644); err != nil {
+		t.Fatalf("write stale video: %v", err)
+	}
+
+	cfg.Force = true
+	rep := discardReporter()
+	if err := process(t.Context(), cfg, rep); err != nil {
+		t.Fatalf("second process() error = %v", err)
+	}
+	if rep.extracted != 1 || rep.notMotion != 1 {
+		t.Fatalf("extracted = %d, notMotion = %d, want 1 and 1", rep.extracted, rep.notMotion)
+	}
+	if got, want := fileSize(filepath.Join(dir, "a_video.mp4")), int64(24); got != want {
+		t.Fatalf("video size = %d, want %d", got, want)
+	}
+}
+
 func TestProcessGlobPattern(t *testing.T) {
 	tempDir := t.TempDir()
 	output := filepath.Join(tempDir, "out")
@@ -505,5 +663,20 @@ func assertFileDoesNotExist(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("expected file %s not to exist, got err=%v", path, err)
+	}
+}
+
+func assertDirEntries(t *testing.T, dir string, want ...string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir %s: %v", dir, err)
+	}
+	var got []string
+	for _, entry := range entries {
+		got = append(got, entry.Name())
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("entries of %s = %q, want %q", dir, got, want)
 	}
 }

@@ -70,6 +70,27 @@ func TestResolveInputDirectoryWithTrailingSlashIsNotRegex(t *testing.T) {
 	}
 }
 
+func TestRegexInput(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+		ok    bool
+	}{
+		{input: `/IMG_\d{4}\.jpg/`, want: `IMG_\d{4}\.jpg`, ok: true},
+		{input: "/a|b/", want: "a|b", ok: true},
+		{input: "/missing/photos/"},
+		{input: "photos/"},
+		{input: "/"},
+	}
+
+	for _, tc := range tests {
+		got, ok := regexInput(tc.input)
+		if ok != tc.ok || (ok && got != tc.want) {
+			t.Fatalf("regexInput(%q) = %q, %t; want %q, %t", tc.input, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
 func TestResolveInputMissingFileIsLeftForExtraction(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.jpg")
 

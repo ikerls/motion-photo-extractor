@@ -19,7 +19,7 @@ import (
 var ErrHelp = pflag.ErrHelp
 
 type Config struct {
-	// Inputs holds the files, directories or patterns to process: the one
+	// Inputs holds the files, directories or patterns to process: those
 	// given with --input followed by the positional arguments or, when the
 	// command line names none, the "input" config key.
 	Inputs []string `yaml:"-"`
@@ -31,6 +31,10 @@ type Config struct {
 	ExtractVideo bool      `yaml:"extract_video"`
 	Force        bool      `yaml:"force"`
 	Log          LogConfig `yaml:"log"`
+
+	// Recover is set when --recover was passed: what an interrupted run left
+	// behind is cleaned up before anything is extracted.
+	Recover bool `yaml:"-"`
 
 	// ShowVersion is set when --version was passed.
 	ShowVersion bool `yaml:"-"`
@@ -65,10 +69,13 @@ var (
 	legacyExts = []string{".toml", ".hcl", ".tfvars", ".ini", ".properties", ".props", ".prop", ".env", ".dotenv"}
 )
 
+// inputKey is the config key of the input. Unlike the other keys it is not
+// set by its flag, which may be given several times: see Config.Inputs.
+const inputKey = "input"
+
 // flagKeys maps each CLI flag to the config key it sets. The key also names
 // the environment variable: log.level is read from GO_MOTION_PHOTO_LOG_LEVEL.
 var flagKeys = map[string]string{
-	"input":          "input",
 	"output":         "output",
 	"delete-orig":    "delete_orig",
 	"rename-orig":    "rename_orig",
@@ -93,7 +100,7 @@ func Load(args []string) (*Config, error) {
 
 	flags := pflag.NewFlagSet(appName, pflag.ContinueOnError)
 	flags.Usage = func() {}
-	flags.StringVarP(&file.Input, "input", "i", "", "Input motion photo file or directory path (*.jpg, *.jpeg, *.heic)")
+	inputs := flags.StringArrayP("input", "i", nil, "Input motion photo file or directory path (*.jpg, *.jpeg, *.heic)")
 	flags.StringVarP(&cfg.OutputDir, "output", "o", ".", "Directory to save extracted files")
 	flags.BoolVar(&cfg.DeleteOrig, "delete-orig", false, "Delete original file after successful extraction")
 	flags.BoolVar(&cfg.RenameOrig, "rename-orig", false, "Rename original file and don't append _photo/_video to extracted files")
@@ -104,6 +111,7 @@ func Load(args []string) (*Config, error) {
 	flags.StringVar(&cfg.Log.Level, "log-level", "info", "Log level (debug, info, warn, error)")
 	flags.StringVar(&cfg.Log.Format, "log-format", "auto", "Console output format (auto, pretty, text, json)")
 	flags.BoolVar(&cfg.Log.NoConsole, "no-console-log", false, "Disable console logging")
+	flags.BoolVar(&cfg.Recover, "recover", false, "Clean up what an interrupted run left behind")
 	flags.BoolVarP(&cfg.ShowVersion, "version", "V", false, "Print version and exit")
 	verbose := flags.BoolP("verbose", "v", false, "Same as --log-level debug")
 	quiet := flags.BoolP("quiet", "q", false, "Same as --log-level warn")
@@ -124,7 +132,9 @@ func Load(args []string) (*Config, error) {
 	// and the command line values are then put back.
 	fromCLI := make(map[string]string)
 	flags.Visit(func(f *pflag.Flag) {
-		fromCLI[f.Name] = f.Value.String()
+		if _, ok := flagKeys[f.Name]; ok {
+			fromCLI[f.Name] = f.Value.String()
+		}
 	})
 
 	data, path, ignored, err := readConfigFile(*configFile)
@@ -137,10 +147,15 @@ func Load(args []string) (*Config, error) {
 	}
 	cfg.IgnoredConfigFiles = ignored
 
+	if value := os.Getenv(envName(inputKey)); value != "" {
+		file.Input = value
+	}
 	for flagName, key := range flagKeys {
 		name := envName(key)
 		value := os.Getenv(name)
-		if value == "" {
+		// A variable that the command line overrides is not read, so that it
+		// cannot be what is wrong with the invocation.
+		if _, overridden := fromCLI[flagName]; value == "" || overridden {
 			continue
 		}
 		if err := flags.Set(flagName, value); err != nil {
@@ -163,10 +178,9 @@ func Load(args []string) (*Config, error) {
 		cfg.Log.Level = "warn"
 	}
 
-	_, inputFromCLI := fromCLI["input"]
 	switch {
-	case inputFromCLI:
-		cfg.Inputs = append([]string{file.Input}, flags.Args()...)
+	case len(*inputs) > 0:
+		cfg.Inputs = append(*inputs, flags.Args()...)
 	case flags.NArg() > 0:
 		cfg.Inputs = flags.Args()
 	case file.Input != "":
@@ -229,7 +243,110 @@ func decodeConfig(path string, data []byte, v any) error {
 			return err
 		}
 	}
-	return yaml.Unmarshal(data, v)
+	// Decoding comes first: it turns down what the keys could not be checked
+	// in, anchors that contain themselves for one.
+	if err := yaml.Unmarshal(data, v); err != nil {
+		return err
+	}
+	return checkConfigKeys(data)
+}
+
+// checkConfigKeys returns an error for a key in the config file data that is
+// not a config key, such as a misspelled one, which would otherwise be left
+// unread without a word.
+func checkConfigKeys(data []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil || len(doc.Content) == 0 {
+		// Not a document with keys to check.
+		return nil
+	}
+
+	known := []string{inputKey}
+	for _, key := range flagKeys {
+		known = append(known, key)
+	}
+	slices.Sort(known)
+
+	return checkConfigMapping(doc.Content[0], "", known, make(map[configMapping]bool))
+}
+
+// configMapping is a mapping of the config file as found under a key prefix.
+type configMapping struct {
+	node   *yaml.Node
+	prefix string
+}
+
+// checkConfigMapping checks the keys of node, the mapping under the key
+// prefix, against the dotted keys in known. checked holds the mappings that
+// need no checking again: aliases may lead to one any number of times.
+func checkConfigMapping(node *yaml.Node, prefix string, known []string, checked map[configMapping]bool) error {
+	node = resolveAlias(node)
+	if node.Kind != yaml.MappingNode {
+		// Decoding reported what is there in place of a mapping.
+		return nil
+	}
+	if checked[configMapping{node, prefix}] {
+		return nil
+	}
+	checked[configMapping{node, prefix}] = true
+
+	// Keys and values alternate in the content of a mapping.
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		name, value := resolveAlias(node.Content[i]), resolveAlias(node.Content[i+1])
+
+		// A merge key brings in the keys of one mapping or of several.
+		if name.Tag == "!!merge" {
+			merged := []*yaml.Node{value}
+			if value.Kind == yaml.SequenceNode {
+				merged = value.Content
+			}
+			for _, mapping := range merged {
+				if err := checkConfigMapping(mapping, prefix, known, checked); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+
+		key := prefix + name.Value
+
+		// A key written with a dot is not one of a section: only log.level
+		// spelled as level under log is read.
+		isSection := !strings.Contains(name.Value, ".") &&
+			slices.ContainsFunc(known, func(k string) bool { return strings.HasPrefix(k, key+".") })
+		if isSection {
+			if err := checkConfigMapping(value, key+".", known, checked); err != nil {
+				return err
+			}
+			continue
+		}
+		if slices.Contains(known, key) && !strings.Contains(name.Value, ".") {
+			continue
+		}
+
+		if section, option, ok := strings.Cut(name.Value, "."); ok && slices.Contains(known, key) {
+			return fmt.Errorf("unknown key %q, write it as %q under %q", key, option, section)
+		}
+		best, bestDistance := "", 3
+		for _, candidate := range known {
+			if d := editDistance(key, candidate); d < bestDistance {
+				best, bestDistance = candidate, d
+			}
+		}
+		if best == "" {
+			return fmt.Errorf("unknown key %q", key)
+		}
+		return fmt.Errorf("unknown key %q, did you mean %q?", key, best)
+	}
+	return nil
+}
+
+// resolveAlias returns the node that node stands for, if it is an alias.
+func resolveAlias(node *yaml.Node) *yaml.Node {
+	if node.Kind == yaml.AliasNode && node.Alias != nil {
+		return node.Alias
+	}
+	return node
 }
 
 // withSuggestion adds the closest flag name to an unknown flag error.

@@ -382,6 +382,69 @@ func TestProcessStopsWhenInterrupted(t *testing.T) {
 	assertFileDoesNotExist(t, filepath.Join(dir, "out", "a_video.mp4"))
 }
 
+// lateInterrupt is a context that is canceled once the first file is being
+// processed, as when Ctrl+C is pressed during the last one.
+type lateInterrupt struct {
+	context.Context
+	checks int
+}
+
+func (c *lateInterrupt) Err() error {
+	if c.checks++; c.checks > 1 {
+		return context.Canceled
+	}
+	return nil
+}
+
+// An interrupt during the last file leaves nothing to stop, but the run
+// still ends as interrupted.
+func TestProcessReportsAnInterruptDuringTheLastFile(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "a.jpg")
+	writeMotionPhotoFixture(t, input)
+
+	ctx := &lateInterrupt{Context: t.Context()}
+	if err := process(ctx, testConfig(filepath.Join(dir, "out"), input), discardReporter()); !errors.Is(err, errInterrupted) {
+		t.Fatalf("process() error = %v, want errInterrupted", err)
+	}
+	assertFileExists(t, filepath.Join(dir, "out", "a_video.mp4"))
+}
+
+func TestPrettyReportsOriginalsOfAnEarlierExtraction(t *testing.T) {
+	dir := t.TempDir()
+	writeMotionPhotoFixture(t, filepath.Join(dir, "a.jpg"))
+	writeMotionPhotoFixture(t, filepath.Join(dir, "b.jpg"))
+
+	if status, got := runPretty(t, dir, ".", "--rename-orig"); status != 0 {
+		t.Fatalf("status = %d, output:\n%s", status, got)
+	}
+
+	status, got := runPretty(t, dir, ".", "--rename-orig")
+	if want := "2 files without a video and 2 originals of an earlier extraction skipped"; status != 0 || !strings.Contains(got, want) {
+		t.Fatalf("status = %d, output:\n%s\nwant it to contain %q", status, got, want)
+	}
+
+	status, got = runPretty(t, dir, "a_original.jpg", "--rename-orig")
+	if want := "– a_original.jpg  skipped, already extracted: it is the original of a.jpg\n"; status != 0 || got != want {
+		t.Fatalf("status = %d, output = %q, want %q", status, got, want)
+	}
+}
+
+// A directory that does not exist is not a regular expression, even though
+// its path is written between slashes.
+func TestPrettyReportsMissingDirectoryWrittenBetweenSlashes(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.ToSlash(filepath.Join(dir, "missing")) + "/"
+	if !strings.HasPrefix(missing, "/") {
+		t.Skip("needs paths that begin with a slash")
+	}
+
+	status, got := runPretty(t, dir, missing)
+	if want := "✗ " + missing + ": no such file or directory\n"; status != 1 || got != want {
+		t.Fatalf("status = %d, output = %q, want %q", status, got, want)
+	}
+}
+
 func TestFormatSize(t *testing.T) {
 	tests := map[int64]string{
 		0:                "0 B",
