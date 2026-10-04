@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 440 400" width="440" height="400" role="img" aria-labelledby="title">
+  <title id="title">Go Motion Photo mascot: a gopher pulling a film strip out of a photo</title>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7c5cff"/>
+      <stop offset="1" stop-color="#ff9a76"/>
+    </linearGradient>
+    <linearGradient id="frames" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#7c5cff"/>
+      <stop offset="1" stop-color="#ff9a76"/>
+    </linearGradient>
+    <path id="body" d="M190 36 C252 34 294 58 300 112 C306 172 308 240 300 292 C292 338 242 346 190 346 C138 346 88 338 80 292 C72 240 74 172 80 112 C86 58 128 34 190 36 Z"/>
+    <clipPath id="inside"><use href="#body"/></clipPath>
+    <clipPath id="picture"><rect x="-55" y="-56" width="110" height="88" rx="4"/></clipPath>
+    <path id="film" d="M232 292 C292 316 356 300 372 246 C386 200 346 176 362 122"/>
+    <path id="spark" d="M0 -13 C2 -4 4 -2 13 0 C4 2 2 4 0 13 C-2 4 -4 2 -13 0 C-4 -2 -2 -4 0 -13 Z"/>
+    <!-- a white edge, so the outline holds on dark backgrounds -->
+    <filter id="sticker" x="-10%" y="-10%" width="120%" height="120%">
+      <feMorphology in="SourceAlpha" operator="dilate" radius="4"/>
+      <feGaussianBlur stdDeviation="1"/>
+      <feComponentTransfer><feFuncA type="linear" slope="4"/></feComponentTransfer>
+      <feFlood flood-color="#fff"/>
+      <feComposite operator="in" in2="SourceGraphic"/>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <ellipse cx="200" cy="372" rx="150" ry="10" fill="#020203" fill-opacity=".13"/>
+
+  <g fill="#ffd166">
+    <use href="#spark" x="36" y="96"/>
+    <use href="#spark" x="408" y="70"/>
+    <use href="#spark" transform="translate(58 46) scale(.55)" fill="#7c5cff"/>
+    <use href="#spark" transform="translate(32 300) scale(.55)" fill="#7c5cff"/>
+    <use href="#spark" transform="translate(416 330) scale(.55)" fill="#7c5cff"/>
+  </g>
+
+  <g filter="url(#sticker)" stroke="#020203" stroke-width="5" stroke-linecap="round" stroke-linejoin="round">
+    <!-- ears -->
+    <g transform="rotate(-38 104 58)">
+      <ellipse cx="104" cy="58" rx="21" ry="18" fill="#6cd1ef"/>
+      <ellipse cx="104" cy="60" rx="10" ry="8" fill="#3fb2d6" stroke="none"/>
+    </g>
+    <g transform="rotate(38 276 58)">
+      <ellipse cx="276" cy="58" rx="21" ry="18" fill="#6cd1ef"/>
+      <ellipse cx="276" cy="60" rx="10" ry="8" fill="#3fb2d6" stroke="none"/>
+    </g>
+    <!-- feet -->
+    <ellipse cx="128" cy="348" rx="13" ry="21" fill="#dcc8bb" transform="rotate(24 128 348)"/>
+    <ellipse cx="252" cy="348" rx="13" ry="21" fill="#dcc8bb" transform="rotate(-24 252 348)"/>
+
+    <!-- body, shaded on the left like the light comes from the right -->
+    <use href="#body" fill="#6cd1ef"/>
+    <g clip-path="url(#inside)" stroke="none">
+      <path d="M60 20 H118 C92 120 92 250 124 360 H60 Z" fill="#1f8fb8" fill-opacity=".28"/>
+      <path d="M60 330 C140 318 240 318 320 330 V360 H60 Z" fill="#1f8fb8" fill-opacity=".22"/>
+    </g>
+    <use href="#body" fill="none"/>
+
+    <!-- eyes, looking down at the photo -->
+    <circle cx="127" cy="118" r="47" fill="#fef6f1"/>
+    <circle cx="253" cy="118" r="47" fill="#fef6f1"/>
+    <circle cx="146" cy="134" r="16" fill="#020203" stroke="none"/>
+    <circle cx="236" cy="134" r="16" fill="#020203" stroke="none"/>
+    <circle cx="152" cy="127" r="6" fill="#fff" stroke="none"/>
+    <circle cx="242" cy="127" r="6" fill="#fff" stroke="none"/>
+    <!-- teeth, muzzle, nose -->
+    <g stroke-width="4">
+      <rect x="181" y="176" width="18" height="24" rx="6" fill="#fff"/>
+      <path d="M190 184 V198" stroke-width="3"/>
+      <ellipse cx="190" cy="172" rx="23" ry="14" fill="#dcc8bb"/>
+      <ellipse cx="190" cy="160" rx="15" ry="10" fill="#020203"/>
+    </g>
+    <ellipse cx="185" cy="157" rx="5" ry="2.500" fill="#fff" fill-opacity=".45" stroke="none"/>
+
+    <!-- the video, pulled out of the photo as a film strip -->
+    <g fill="none" stroke-linecap="butt">
+      <use href="#film" stroke-width="46"/>
+      <use href="#film" stroke="#2b2350" stroke-width="35"/>
+      <use href="#film" stroke="#fff" stroke-opacity=".9" stroke-width="29" stroke-dasharray="6 7"/>
+      <use href="#film" stroke="#2b2350" stroke-width="19"/>
+      <use href="#film" stroke="url(#frames)" stroke-width="17" stroke-dasharray="24 6" stroke-dashoffset="-4"/>
+    </g>
+
+    <!-- the photo -->
+    <g transform="translate(184 272) rotate(-6)">
+      <rect x="-66" y="-67" width="132" height="134" rx="8" fill="#fff"/>
+      <g clip-path="url(#picture)" stroke="none">
+        <rect x="-55" y="-56" width="110" height="88" fill="url(#sky)"/>
+        <circle cx="30" cy="-30" r="12" fill="#ffe08a"/>
+        <path d="M-55 32 V14 L-26 -18 L-2 10 L14 -6 L55 32 Z" fill="#2b2350"/>
+        <path d="M-26 -18 L-15 -5 L-23 -8 L-30 -1 L-37 -6 Z" fill="#fff" fill-opacity=".85"/>
+      </g>
+      <rect x="-55" y="-56" width="110" height="88" rx="4" fill="none" stroke-width="4"/>
+      <path d="M-30 50 H30" stroke="#c3cad1" stroke-width="5"/>
+    </g>
+
+    <!-- hands -->
+    <ellipse cx="114" cy="262" rx="19" ry="13" fill="#dcc8bb" transform="rotate(20 114 262)"/>
+    <ellipse cx="254" cy="250" rx="19" ry="13" fill="#dcc8bb" transform="rotate(-24 254 250)"/>
+  </g>
+</svg>
