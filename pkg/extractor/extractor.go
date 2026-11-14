@@ -2,581 +2,538 @@ package extractor
 
 import (
 	"bytes"
-	"encoding/binary"
+	"cmp"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
+	"syscall"
 	"time"
-
-	"github.com/charmbracelet/log"
-	"github.com/ikerls/motion-photo-extractor/pkg/files"
 )
 
-var (
-	magicV1 = []byte("MotionPhoto_Data")
-	magicV2 = []byte("mpvd")
-	jpegSOI = []byte{0xFF, 0xD8}
-	jpegEOI = []byte{0xFF, 0xD9}
+// Options controls how ExtractFile writes its output. The zero value extracts
+// both components next to the input file and leaves the input untouched.
+type Options struct {
+	// OutputDir is where extracted files are written. It is created if
+	// missing. Empty means the directory of the input file.
+	OutputDir string
 
-	xmpStartTag = []byte("<x:xmpmeta")
-	xmpEndTag   = []byte("</x:xmpmeta>")
+	// SkipPhoto and SkipVideo disable extraction of one component.
+	SkipPhoto bool
+	SkipVideo bool
 
-	motionPhotoSemantic = []byte(`Item:Semantic="MotionPhoto"`)
-	stillImageSemantic  = []byte(`Item:Semantic="Still_Image"`)
-	lengthAttrPrefix    = []byte(`Item:Length="`)
+	// Overwrite replaces existing output files. Without it, a component whose
+	// output already exists is left alone and reported in Result.Skipped.
+	//
+	// It never replaces an earlier IMG_original.jpg, unless that file has the
+	// same content as the input.
+	Overwrite bool
 
-	motionPhotoEnabledAttrs = [][2][]byte{
-		{[]byte(`GCamera:MotionPhoto="1"`), []byte(`GCamera:MotionPhoto="0"`)},
-		{[]byte(`Camera:MotionPhoto="1"`), []byte(`Camera:MotionPhoto="0"`)},
-		{[]byte(`GCamera:MicroVideo="1"`), []byte(`GCamera:MicroVideo="0"`)},
-		{[]byte(`Camera:MicroVideo="1"`), []byte(`Camera:MicroVideo="0"`)},
-	}
+	// RenameOriginal gives the extracted files the input's base name
+	// (IMG.jpg, IMG.mp4) and moves the input to IMG_original.jpg in the
+	// output directory, which may be on another filesystem. Without it the
+	// outputs are IMG_photo.jpg and IMG_video.mp4.
+	//
+	// An input that is a link stays one when moved within its directory.
+	// Moved to another, it is replaced by a copy of the file it leads to.
+	RenameOriginal bool
 
-	motionPhotoOffsetPrefixes = [][]byte{
-		[]byte(`GCamera:MotionPhotoOffset="`),
-		[]byte(`Camera:MotionPhotoOffset="`),
-		[]byte(`GCamera:MicroVideoOffset="`),
-		[]byte(`Camera:MicroVideoOffset="`),
-	}
-)
-
-type Extractor struct{}
-
-const (
-	xmpSearchLimit       = 512 << 10
-	markerTailSearchSize = 16 << 20
-	jpegTailSearchSize   = 256 << 10
-)
-
-func New() *Extractor {
-	return &Extractor{}
+	// DeleteOriginal removes the input once extraction has succeeded. Combined
+	// with RenameOriginal the input is deleted instead of renamed.
+	//
+	// The input is only deleted when every requested component was written by
+	// the call. If one is reported in Result.Skipped, DeleteOriginal is
+	// ignored: the existing output may not come from this input.
+	DeleteOriginal bool
 }
 
-func (e *Extractor) Process(filename, outputDir string, deleteOrig, renameOrig, extractPhoto, extractVideo bool, force bool) error {
-	if !extractPhoto && !extractVideo {
-		return fmt.Errorf("nothing to extract: both photo and video extraction are disabled")
-	}
+// Result describes what ExtractFile did.
+type Result struct {
+	// PhotoPath and VideoPath are the files written, empty if a component was
+	// not written.
+	PhotoPath string
+	VideoPath string
 
-	if err := validateExtension(filename); err != nil {
-		return err
-	}
+	// OriginalPath is where the input file is now: unchanged, renamed, or
+	// empty if it was deleted. It is never empty when Skipped is not.
+	OriginalPath string
 
-	data, fileInfo, err := files.ReadFileWithInfo(filename)
-	if err != nil {
-		return err
-	}
+	// Skipped lists outputs that already existed and were not overwritten.
+	Skipped []string
 
-	log.Infof("Processing file: %s\n", filename)
-	jpegData, mp4Data, err := e.splitContent(data)
-	if err != nil {
-		return err
-	}
-	if extractPhoto {
-		jpegData = sanitizeExtractedPhoto(jpegData)
-	}
-
-	return e.writeFiles(filename, outputDir, jpegData, mp4Data, fileInfo.ModTime(),
-		deleteOrig, renameOrig, extractPhoto, extractVideo, force)
+	// Method is how the split point was found.
+	Method Method
 }
 
-func (e *Extractor) splitContent(data []byte) (jpegData, mp4Data []byte, err error) {
-	log.Debugf("Searching for motion photo split point...")
-
-	videoStart, splitSource, err := findVideoStart(data)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	jpegEnd := findJPEGEnd(data[:videoStart])
-	if jpegEnd == -1 {
-		jpegEnd = videoStart
-	}
-
-	log.Debugf("Using %s split point at position: %d\n", splitSource, videoStart)
-	return data[:jpegEnd], data[videoStart:], nil
-}
-
-func findVideoStart(data []byte) (int, string, error) {
-	seen := make(map[int]struct{}, 3)
-	issues := make([]string, 0, 3)
-
-	if videoLength, ok := findMotionPhotoVideoLength(data); ok {
-		start := len(data) - videoLength
-		if err := recordCandidateIssue(data, seen, start, "metadata"); err == nil {
-			return start, "metadata", nil
-		} else {
-			issues = append(issues, err.Error())
-		}
-	}
-
-	if start, ok, issue := findMarkerCandidate(data, magicV1, "MotionPhoto_Data marker", seen); ok {
-		return start, "MotionPhoto_Data marker", nil
-	} else if issue != "" {
-		issues = append(issues, issue)
-	}
-
-	if start, ok, issue := findMarkerCandidate(data, magicV2, "mpvd marker", seen); ok {
-		return start, "mpvd marker", nil
-	} else if issue != "" {
-		issues = append(issues, issue)
-	}
-
-	if len(issues) == 0 {
-		return 0, "", fmt.Errorf("no motion photo metadata or marker found in file")
-	}
-
-	return 0, "", fmt.Errorf("no valid motion photo video found: %s", strings.Join(issues, "; "))
-}
-
-func recordCandidateIssue(data []byte, seen map[int]struct{}, start int, source string) error {
-	if _, ok := seen[start]; ok {
-		return fmt.Errorf("%s: duplicate split candidate at %d", source, start)
-	}
-	seen[start] = struct{}{}
-
-	if err := validateSplitCandidate(data, start); err != nil {
-		return fmt.Errorf("%s: %v", source, err)
-	}
-
-	return nil
-}
-
-func findMarkerCandidate(data, magic []byte, source string, seen map[int]struct{}) (int, bool, string) {
-	if len(data) < len(magic) {
-		return 0, false, ""
-	}
-
-	searchStart := 0
-	if len(data) > markerTailSearchSize {
-		searchStart = len(data) - markerTailSearchSize
-	}
-
-	if start, ok, issue := searchMarkerRegion(data, data[searchStart:], searchStart, magic, source, seen); ok {
-		return start, true, ""
-	} else if issue != "" && searchStart == 0 {
-		return 0, false, issue
-	}
-
-	if searchStart == 0 {
-		return 0, false, ""
-	}
-
-	return searchMarkerRegion(data, data[:searchStart+len(magic)-1], 0, magic, source, seen)
-}
-
-func searchMarkerRegion(data, region []byte, base int, magic []byte, source string, seen map[int]struct{}) (int, bool, string) {
-	var lastIssue string
-
-	for len(region) >= len(magic) {
-		markerIndex := bytes.LastIndex(region, magic)
-		if markerIndex == -1 {
-			break
-		}
-
-		start := base + markerIndex + len(magic)
-		if err := recordCandidateIssue(data, seen, start, source); err == nil {
-			return start, true, ""
-		} else {
-			lastIssue = err.Error()
-		}
-
-		region = region[:markerIndex]
-	}
-
-	return 0, false, lastIssue
-}
-
-func validateSplitCandidate(data []byte, start int) error {
-	if start <= 0 || start >= len(data) {
-		return fmt.Errorf("candidate start %d out of range", start)
-	}
-
-	if bytes.HasPrefix(data, jpegSOI) {
-		if findJPEGEndBefore(data, start) == -1 {
-			return fmt.Errorf("no JPEG end marker before candidate")
-		}
-	}
-
-	if !looksLikeMP4(data[start:]) {
-		return fmt.Errorf("candidate payload does not look like MP4")
-	}
-
-	return nil
-}
-
-func findMotionPhotoVideoLength(data []byte) (int, bool) {
-	searchArea := headerSearchArea(data)
-	if xmp, ok := xmpSearchArea(searchArea); ok {
-		searchArea = xmp
-	}
-
-	if length, ok := findMotionPhotoItemLength(searchArea); ok {
-		return length, true
-	}
-
-	if offset, ok := findFirstIntAttribute(searchArea, motionPhotoOffsetPrefixes...); ok {
-		return offset, true
-	}
-
-	return 0, false
-}
-
-func headerSearchArea(data []byte) []byte {
-	if len(data) > xmpSearchLimit {
-		return data[:xmpSearchLimit]
-	}
-	return data
-}
-
-func xmpSearchArea(data []byte) ([]byte, bool) {
-	start, end, ok := findXMPBlock(data)
-	if !ok {
-		return nil, false
-	}
-	return data[start:end], true
-}
-
-func findXMPBlock(data []byte) (int, int, bool) {
-	start := bytes.Index(data, xmpStartTag)
-	if start == -1 {
-		return 0, 0, false
-	}
-
-	end := bytes.Index(data[start:], xmpEndTag)
-	if end == -1 {
-		return 0, 0, false
-	}
-
-	end += start + len(xmpEndTag)
-	return start, end, true
-}
-
-func findMotionPhotoItemLength(data []byte) (int, bool) {
-	searchStart := 0
-	for {
-		semanticIndex := bytes.Index(data[searchStart:], motionPhotoSemantic)
-		if semanticIndex == -1 {
-			return 0, false
-		}
-		semanticIndex += searchStart
-
-		tagStart := bytes.LastIndexByte(data[:semanticIndex], '<')
-		tagEnd := bytes.IndexByte(data[semanticIndex:], '>')
-		if tagStart != -1 && tagEnd != -1 {
-			tag := data[tagStart : semanticIndex+tagEnd+1]
-			if length, ok := findIntAttribute(tag, lengthAttrPrefix); ok && length > 0 {
-				return length, true
-			}
-		}
-
-		searchStart = semanticIndex + len(motionPhotoSemantic)
-	}
-}
-
-func findFirstIntAttribute(data []byte, prefixes ...[]byte) (int, bool) {
-	for _, prefix := range prefixes {
-		if value, ok := findIntAttribute(data, prefix); ok && value > 0 {
-			return value, true
-		}
-	}
-	return 0, false
-}
-
-func findIntAttribute(data, prefix []byte) (int, bool) {
-	start := bytes.Index(data, prefix)
-	if start == -1 {
-		return 0, false
-	}
-
-	start += len(prefix)
-	end := start
-	for end < len(data) && data[end] >= '0' && data[end] <= '9' {
-		end++
-	}
-
-	if end == start || end >= len(data) || data[end] != '"' {
-		return 0, false
-	}
-
-	return parsePositiveInt(data[start:end])
-}
-
-func parsePositiveInt(data []byte) (int, bool) {
-	if len(data) == 0 {
-		return 0, false
-	}
-
-	value := 0
-	for _, digit := range data {
-		if digit < '0' || digit > '9' {
-			return 0, false
-		}
-		value = (value * 10) + int(digit-'0')
-	}
-
-	return value, true
-}
-
-func findJPEGEnd(data []byte) int {
-	return findJPEGEndBefore(data, len(data))
-}
-
-func findJPEGEndBefore(data []byte, limit int) int {
-	if limit > len(data) {
-		limit = len(data)
-	}
-
-	searchStart := 0
-	if limit > jpegTailSearchSize {
-		searchStart = limit - jpegTailSearchSize
-	}
-
-	eoiIndex := bytes.LastIndex(data[searchStart:limit], jpegEOI)
-	if eoiIndex == -1 {
-		if searchStart == 0 {
-			return -1
-		}
-
-		eoiIndex = bytes.LastIndex(data[:limit], jpegEOI)
-		if eoiIndex == -1 {
-			return -1
-		}
-		return eoiIndex + 2
-	}
-
-	return searchStart + eoiIndex + 2
-}
-
-func looksLikeMP4(data []byte) bool {
-	const (
-		maxBoxesToScan  = 4
-		maxBytesToSniff = 4096
-	)
-
-	sniffLimit := len(data)
-	if sniffLimit > maxBytesToSniff {
-		sniffLimit = maxBytesToSniff
-	}
-
-	offset := 0
-	for boxesSeen := 0; boxesSeen < maxBoxesToScan && offset+8 <= sniffLimit; boxesSeen++ {
-		boxSize, headerSize, boxType, ok := readMP4BoxHeader(data[offset:])
-		if !ok {
-			return false
-		}
-
-		if boxSize < headerSize || offset+boxSize > len(data) {
-			return false
-		}
-
-		if boxType == "ftyp" {
-			return boxSize >= 16
-		}
-
-		if !isAllowedLeadingMP4Box(boxType) || offset+boxSize > sniffLimit {
-			return false
-		}
-
-		offset += boxSize
-	}
-
-	return false
-}
-
-func readMP4BoxHeader(data []byte) (boxSize int, headerSize int, boxType string, ok bool) {
-	if len(data) < 8 {
-		return 0, 0, "", false
-	}
-
-	boxTypeBytes := data[4:8]
-	if !isASCIIBoxType(boxTypeBytes) {
-		return 0, 0, "", false
-	}
-
-	size := binary.BigEndian.Uint32(data[:4])
-	headerSize = 8
-
-	switch size {
-	case 0:
-		return 0, 0, "", false
-	case 1:
-		if len(data) < 16 {
-			return 0, 0, "", false
-		}
-		largeSize := binary.BigEndian.Uint64(data[8:16])
-		if largeSize > uint64(len(data)) || largeSize < 16 {
-			return 0, 0, "", false
-		}
-		boxSize = int(largeSize)
-		headerSize = 16
-	default:
-		if size < 8 {
-			return 0, 0, "", false
-		}
-		boxSize = int(size)
-	}
-
-	return boxSize, headerSize, string(boxTypeBytes), true
-}
-
-func isASCIIBoxType(boxType []byte) bool {
-	for _, b := range boxType {
-		if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == ' ' {
-			continue
-		}
-		return false
-	}
-	return true
-}
-
-func isAllowedLeadingMP4Box(boxType string) bool {
-	switch boxType {
-	case "free", "skip", "wide", "uuid":
+// SupportedExtension reports whether path has an extension ExtractFile
+// accepts: .jpg, .jpeg or .heic, in any case.
+func SupportedExtension(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".jpg", ".jpeg", ".heic":
 		return true
 	default:
 		return false
 	}
 }
 
-func sanitizeExtractedPhoto(data []byte) []byte {
-	searchArea := headerSearchArea(data)
-	start, end, ok := findXMPBlock(searchArea)
-	if !ok {
-		return data
+// ExtractFile splits the motion photo at path and writes its components
+// according to opts. Outputs keep the modification time of the input.
+//
+// On error everything is as it was found: nothing is left behind, an output
+// that Overwrite replaced is put back and the input is untouched. There is
+// one exception: if the outputs were written but the input could not be
+// deleted, or removed once copied elsewhere, both a Result and an error are
+// returned.
+//
+// A process that is killed while ExtractFile is at work has no such chance
+// to clean up. What it leaves behind is found by FindLeftovers and dealt
+// with by Recover.
+func ExtractFile(path string, opts Options) (Result, error) {
+	if opts.SkipPhoto && opts.SkipVideo {
+		return Result{}, ErrNothingToExtract
 	}
 
-	xmp := data[start:end]
-	for _, replacement := range motionPhotoEnabledAttrs {
-		replaceAllSameLength(xmp, replacement[0], replacement[1])
+	// A path that leads nowhere is reported as such, whatever its extension.
+	info, err := os.Stat(path)
+	if err != nil {
+		return Result{}, err
 	}
-	replaceAllSameLength(xmp, motionPhotoSemantic, stillImageSemantic)
-	for _, prefix := range motionPhotoOffsetPrefixes {
-		zeroAttributeDigits(xmp, prefix)
+	// The input itself, which is not the file it leads to if it is a link.
+	entry, err := os.Lstat(path)
+	if err != nil {
+		return Result{}, err
+	}
+	if !SupportedExtension(path) {
+		return Result{}, fmt.Errorf("%w: %q", ErrUnsupportedExtension, filepath.Ext(path))
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Result{}, err
 	}
 
-	return data
-}
-
-func replaceAllSameLength(data, oldValue, newValue []byte) {
-	if len(oldValue) != len(newValue) {
-		return
+	parts, err := Split(data)
+	if err != nil {
+		return Result{}, err
 	}
 
-	searchStart := 0
-	for {
-		matchIndex := bytes.Index(data[searchStart:], oldValue)
-		if matchIndex == -1 {
-			return
+	outputDir := cmp.Or(opts.OutputDir, filepath.Dir(path))
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		return Result{}, fmt.Errorf("create output directory: %w", err)
+	}
+
+	out := planOutputs(path, outputDir, opts.RenameOriginal)
+	res := Result{OriginalPath: path, Method: parts.Method}
+
+	// With RenameOriginal and the output directory being the input's own, the
+	// photo takes the input's place. That is not a pre-existing output.
+	photoReplacesInput := isSameFile(out.photo, info)
+
+	wanted := func(target string, skip, replacesInput bool) bool {
+		if skip {
+			return false
 		}
-		matchIndex += searchStart
-		copy(data[matchIndex:matchIndex+len(newValue)], newValue)
-		searchStart = matchIndex + len(oldValue)
+		if opts.Overwrite || replacesInput || !exists(target) {
+			return true
+		}
+		res.Skipped = append(res.Skipped, target)
+		return false
 	}
-}
+	writePhoto := wanted(out.photo, opts.SkipPhoto, photoReplacesInput)
+	writeVideo := wanted(out.video, opts.SkipVideo, false)
 
-func zeroAttributeDigits(data, prefix []byte) {
-	searchStart := 0
-	for {
-		attrIndex := bytes.Index(data[searchStart:], prefix)
-		if attrIndex == -1 {
-			return
+	// An output that was already there may have been extracted from another
+	// file, so it is no reason to give up the input.
+	deleteOriginal := opts.DeleteOriginal && len(res.Skipped) == 0
+
+	// An earlier original is not an output and cannot be extracted again, so
+	// Overwrite only replaces it with itself.
+	moveOriginal := opts.RenameOriginal && !deleteOriginal
+	originalExisted := moveOriginal && exists(out.original)
+	if originalExisted {
+		if !opts.Overwrite {
+			return Result{}, fmt.Errorf("renamed original already exists: %s", out.original)
+		}
+		if !hasContent(out.original, data) {
+			return Result{}, fmt.Errorf("renamed original already exists with different content: %s", out.original)
+		}
+	}
+
+	var done changes
+	fail := func(err error) (Result, error) {
+		if undoErr := done.revert(); undoErr != nil {
+			err = fmt.Errorf("%w; not everything could be put back: %w", err, undoErr)
+		}
+		return Result{}, err
+	}
+
+	modTime := info.ModTime()
+
+	// Both components are staged before anything is moved into place, so
+	// that what can go wrong while writing them does so with nothing to
+	// take back but the staged files.
+	var stagedVideo, stagedPhoto string
+	if writeVideo {
+		if stagedVideo, err = done.stage(out.video, parts.Video, modTime); err != nil {
+			return fail(fmt.Errorf("write video: %w", err))
+		}
+	}
+	if writePhoto {
+		SanitizePhoto(parts.Photo)
+		if stagedPhoto, err = done.stage(out.photo, parts.Photo, modTime); err != nil {
+			return fail(fmt.Errorf("write photo: %w", err))
+		}
+	}
+
+	// An original that cannot be renamed, the output directory being on
+	// another filesystem, is copied there. So is the file behind an input
+	// that is a link: moved to another directory, the link may lead nowhere.
+	// The input is then removed last: until that point, undoing the
+	// extraction never involves putting it back.
+	copiedOriginal := false
+	if moveOriginal {
+		// An earlier original is kept until the extraction is through, to
+		// be put back should it fail.
+		if err := done.clear(out.original); err != nil {
+			return fail(fmt.Errorf("rename original: %w", err))
 		}
 
-		digitIndex := searchStart + attrIndex + len(prefix)
-		for digitIndex < len(data) && data[digitIndex] >= '0' && data[digitIndex] <= '9' {
-			data[digitIndex] = '0'
-			digitIndex++
+		err := errCrossDevice
+		if entry.Mode()&os.ModeSymlink == 0 || isSameFile(outputDir, dirInfo(path)) {
+			err = renameFile(path, out.original)
 		}
-
-		searchStart = digitIndex
+		if errors.Is(err, errCrossDevice) {
+			copiedOriginal = true
+			err = copyFile(path, out.original, info)
+		}
+		if err != nil {
+			return fail(fmt.Errorf("rename original: %w", err))
+		}
+		if copiedOriginal {
+			done.undo = append(done.undo, func() error { return removeIfThere(out.original) })
+		} else {
+			done.undo = append(done.undo, func() error { return os.Rename(out.original, path) })
+		}
+		res.OriginalPath = out.original
 	}
-}
 
-func (e *Extractor) writeFiles(filename, outputDir string, jpegData, mp4Data []byte, modTime time.Time,
-	deleteOrig, renameOrig, extractPhoto, extractVideo bool, force bool) error {
-	log.Infof("Writing files to: %s\n", outputDir)
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("failed to create output directory: %v", err)
+	// The photo is only moved into place now that the original is out of the
+	// way, so the original is never the one being overwritten while it is
+	// still the only copy.
+	if writeVideo {
+		if err := done.publish(stagedVideo, out.video); err != nil {
+			return fail(fmt.Errorf("write video: %w", err))
+		}
+		res.VideoPath = out.video
+	}
+	if writePhoto {
+		if err := done.publish(stagedPhoto, out.photo); err != nil {
+			return fail(fmt.Errorf("write photo: %w", err))
+		}
+		res.PhotoPath = out.photo
+	}
+	done.settle()
+
+	// Unless the photo took its place, the input is still there. Should it
+	// not go away, the outputs are kept, as when it cannot be deleted.
+	if copiedOriginal && isSameEntry(path, entry) {
+		if err := os.Remove(path); err != nil {
+			res.OriginalPath = path
+			return res, fmt.Errorf("remove original, copied to %s: %w", out.original, err)
+		}
 	}
 
-	jpegPath, mp4Path, origPath := files.GenerateOutputPaths(filename, outputDir, renameOrig)
-
-	if !force {
-		if extractPhoto {
-			if _, err := os.Stat(jpegPath); err == nil {
-				log.Warnf("JPEG file already exists: %s (skipping photo extraction)\n", jpegPath)
-				extractPhoto = false
+	if deleteOriginal {
+		// When the photo replaced the input there is nothing left to delete.
+		// A photo that replaced a link to the input, or the file that the
+		// input links to, left the input in place.
+		if isSameEntry(path, entry) {
+			if err := os.Remove(path); err != nil {
+				return res, fmt.Errorf("delete original: %w", err)
 			}
 		}
-		if extractVideo {
-			if _, err := os.Stat(mp4Path); err == nil {
-				log.Warnf("MP4 file already exists: %s (skipping video extraction)\n", mp4Path)
-				extractVideo = false
-			}
+		res.OriginalPath = ""
+	}
+
+	return res, nil
+}
+
+// Targets returns the paths ExtractFile may write for path with opts: the
+// requested components and, with RenameOriginal, the moved original. Two
+// inputs that share a target cannot both be extracted with the same opts.
+func Targets(path string, opts Options) []string {
+	out := planOutputs(path, cmp.Or(opts.OutputDir, filepath.Dir(path)), opts.RenameOriginal)
+
+	var targets []string
+	if !opts.SkipPhoto {
+		targets = append(targets, out.photo)
+	}
+	if !opts.SkipVideo {
+		targets = append(targets, out.video)
+	}
+	if out.original != "" {
+		targets = append(targets, out.original)
+	}
+	return targets
+}
+
+// videoExtension is the extension of the extracted video.
+const videoExtension = ".mp4"
+
+type outputPaths struct {
+	photo    string
+	video    string
+	original string
+}
+
+func planOutputs(input, outputDir string, renameOriginal bool) outputPaths {
+	ext := filepath.Ext(input)
+	base := strings.TrimSuffix(filepath.Base(input), ext)
+
+	if renameOriginal {
+		return outputPaths{
+			photo:    filepath.Join(outputDir, base+ext),
+			video:    filepath.Join(outputDir, base+videoExtension),
+			original: filepath.Join(outputDir, base+originalSuffix+ext),
 		}
 	}
 
-	photoSuccess := false
-	videoSuccess := false
-
-	if extractPhoto {
-		log.Debugf("Writing JPEG image (%d bytes) to: %s\n", len(jpegData), jpegPath)
-		if err := files.WriteFileWithTimestamp(jpegPath, jpegData, modTime); err != nil {
-			log.Errorf("Error writing JPEG file: %v\n", err)
-		} else {
-			photoSuccess = true
-		}
-	} else {
-		photoSuccess = true // Skip photo extraction but mark as success
+	return outputPaths{
+		photo: filepath.Join(outputDir, base+"_photo"+ext),
+		video: filepath.Join(outputDir, base+"_video"+videoExtension),
 	}
+}
 
-	if extractVideo {
-		log.Debugf("Writing MP4 video (%d bytes) to: %s\n", len(mp4Data), mp4Path)
-		if err := files.WriteFileWithTimestamp(mp4Path, mp4Data, modTime); err != nil {
-			log.Errorf("Error writing MP4 file: %v\n", err)
-		} else {
-			videoSuccess = true
-		}
-	} else {
-		videoSuccess = true
+// changes records what an extraction did to the filesystem, so that a failure
+// leaves it as it was found.
+type changes struct {
+	// undo takes the changes back, when run in reverse order.
+	undo []func() error
+	// backups are the files that were moved out of the way, kept for undo.
+	backups []string
+}
+
+// stage writes data to a new file next to target and returns its name.
+// Publishing it completes the write.
+func (c *changes) stage(target string, data []byte, modTime time.Time) (string, error) {
+	file, err := createSibling(target, stagedSuffix, 0o644)
+	if err != nil {
+		return "", err
 	}
+	staged := file.Name()
+	c.undo = append(c.undo, func() error { return removeIfThere(staged) })
 
-	if deleteOrig && photoSuccess && videoSuccess {
-		if renameOrig {
-			if err := os.Rename(filename, origPath); err == nil {
-				os.Remove(origPath)
-			}
-		} else {
-			os.Remove(filename)
-		}
-		log.Info("Original file deleted.")
-	} else if renameOrig && photoSuccess && videoSuccess {
-		if err := os.Rename(filename, origPath); err != nil {
-			log.Errorf("Error renaming original file: %v\n", err)
-		} else {
-			log.Infof("Original file renamed to: %s\n", origPath)
-		}
+	_, err = file.Write(data)
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
 	}
+	if err == nil {
+		err = os.Chtimes(staged, modTime, modTime)
+	}
+	return staged, err
+}
 
-	if photoSuccess && videoSuccess {
-		log.Infof("\nSuccess! Files extracted.")
-		if extractPhoto {
-			log.Infof("- JPEG image: %s\n", jpegPath)
-		}
-		if extractVideo {
-			log.Infof("- MP4 video: %s\n", mp4Path)
-		}
+// clear moves the file at target, if there is one, out of the way rather
+// than have it overwritten: it is put back by revert or removed by settle.
+func (c *changes) clear(target string) error {
+	info, err := os.Lstat(target)
+	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("%s is a directory", target)
+	}
 
-	return fmt.Errorf("extraction failed")
+	file, err := createSibling(target, backupSuffix, 0o600)
+	if err != nil {
+		return err
+	}
+	backup := file.Name()
+	file.Close()
+	// A link is moved as such, not the file it leads to.
+	if err := os.Rename(target, backup); err != nil {
+		os.Remove(backup)
+		return err
+	}
+
+	c.undo = append(c.undo, func() error { return os.Rename(backup, target) })
+	c.backups = append(c.backups, backup)
+	return nil
 }
 
-func validateExtension(filename string) error {
-	ext := strings.ToLower(filepath.Ext(filename))
-	if ext != ".jpg" && ext != ".jpeg" && ext != ".heic" {
-		return fmt.Errorf("unsupported file extension: %s", ext)
+// publish moves staged to target, in place of what may be there.
+func (c *changes) publish(staged, target string) error {
+	if err := c.clear(target); err != nil {
+		return err
+	}
+	if err := os.Rename(staged, target); err != nil {
+		return err
+	}
+	c.undo = append(c.undo, func() error { return removeIfThere(target) })
+	return nil
+}
+
+// revert takes every change back. The error tells what could not be, such
+// as a backup that is still under its own name.
+func (c *changes) revert() error {
+	var errs []error
+	for _, undo := range slices.Backward(c.undo) {
+		if err := undo(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// removeIfThere removes the file at path. One that is no longer there, a
+// staged file that was published for one, needs no removing.
+func removeIfThere(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
 	}
 	return nil
+}
+
+// settle makes the changes final: what was moved out of the way is removed.
+func (c *changes) settle() {
+	for _, backup := range c.backups {
+		os.Remove(backup)
+	}
+}
+
+// createSibling creates a file next to path, named after it with a random
+// part and suffix. The name is new: a file that is already there, or a link
+// left in its place, is never written through.
+func createSibling(path, suffix string, perm os.FileMode) (*os.File, error) {
+	create := func(name string) (*os.File, error) {
+		for attempt := 0; ; attempt++ {
+			unique := fmt.Sprintf("%s.%08x%s", name, rand.Uint32(), suffix)
+			file, err := os.OpenFile(unique, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+			if err == nil || !errors.Is(err, fs.ErrExist) || attempt == 100 {
+				return file, err
+			}
+		}
+	}
+
+	file, err := create(path)
+	if err != nil {
+		// The name of path may leave no room for more: a short one does.
+		if short, shortErr := create(filepath.Join(filepath.Dir(path), fallbackName)); shortErr == nil {
+			return short, nil
+		}
+	}
+	return file, err
+}
+
+// renameFile moves the original. Tests replace it to stand in for an output
+// directory on another filesystem.
+var renameFile = os.Rename
+
+// errCrossDevice is what os.Rename fails with when its two paths are on
+// different filesystems.
+var errCrossDevice = func() error {
+	if runtime.GOOS == "windows" {
+		return syscall.Errno(0x11) // ERROR_NOT_SAME_DEVICE
+	}
+	return syscall.EXDEV
+}()
+
+// copyFile copies src, which info describes, to dst along with its
+// permissions and modification time. On error dst is left as it was.
+func copyFile(src, dst string, info os.FileInfo) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := createSibling(dst, stagedSuffix, 0o600)
+	if err != nil {
+		return err
+	}
+	staged := out.Name()
+	_, err = io.Copy(out, in)
+	if closeErr := out.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Chmod(staged, info.Mode().Perm())
+	}
+	if err == nil {
+		err = os.Chtimes(staged, info.ModTime(), info.ModTime())
+	}
+	if err == nil {
+		err = os.Rename(staged, dst)
+	}
+	if err != nil {
+		os.Remove(staged)
+	}
+	return err
+}
+
+func exists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
+func hasContent(path string, want []byte) bool {
+	got, err := os.ReadFile(path)
+	return err == nil && bytes.Equal(got, want)
+}
+
+// isSameFile reports whether path leads to the file that info describes.
+func isSameFile(path string, info os.FileInfo) bool {
+	other, err := os.Stat(path)
+	return err == nil && info != nil && os.SameFile(other, info)
+}
+
+// isSameEntry reports whether path is still the directory entry that entry
+// describes, be it a file or a link, rather than something that replaced it.
+func isSameEntry(path string, entry os.FileInfo) bool {
+	other, err := os.Lstat(path)
+	return err == nil && os.SameFile(other, entry)
+}
+
+// dirInfo describes the directory that holds path, nil if it cannot be read.
+func dirInfo(path string) os.FileInfo {
+	info, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		return nil
+	}
+	return info
+}
+
+// Extractor is the original entry point of this package.
+//
+// Deprecated: use ExtractFile.
+type Extractor struct{}
+
+// New returns an Extractor.
+//
+// Deprecated: use ExtractFile.
+func New() *Extractor {
+	return &Extractor{}
+}
+
+// Process extracts filename into outputDir.
+//
+// Deprecated: use ExtractFile, which takes Options and reports what it wrote.
+func (e *Extractor) Process(filename, outputDir string, deleteOrig, renameOrig, extractPhoto, extractVideo bool, force bool) error {
+	_, err := ExtractFile(filename, Options{
+		OutputDir:      outputDir,
+		SkipPhoto:      !extractPhoto,
+		SkipVideo:      !extractVideo,
+		Overwrite:      force,
+		RenameOriginal: renameOrig,
+		DeleteOriginal: deleteOrig,
+	})
+	return err
 }

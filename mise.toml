@@ -1,0 +1,18 @@
+[tools]
+go = "1.26"
+
+[tasks.run]
+description = "Run the CLI"
+run = "go run ./cmd/go-motion-photo"
+
+[tasks.build]
+description = "Build the binary into bin/"
+run = "go build -o bin/go-motion-photo ./cmd/go-motion-photo"
+
+[tasks.test]
+description = "Run the test suite"
+run = "go test ./..."
+
+[tasks.tidy]
+description = "Tidy and vendor dependencies"
+run = ["go mod tidy", "go mod vendor"]
